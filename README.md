@@ -144,7 +144,7 @@ python script.py --scan-type IAC --app-name "App1,App2"
 
 - Primary output containing all findings in tabular format
 - One row per finding across all scan types
-- Rows are sorted by Application Name, Sandbox Name, Scan Type, Issue ID, so two runs of an unchanged tenant produce identical files and can be diffed
+- Rows are sorted by Application Name, Sandbox Name, Scan Type, Issue ID, Finding UID, so two runs of an unchanged tenant produce identical files and can be diffed
 - Written to a temporary file and moved into place only when the run finishes, so an interrupted run never leaves a truncated CSV or destroys the previous export
 - Filename customizable via `--output` argument
 
@@ -216,6 +216,32 @@ python script.py --app-name "MyApp" --output myapp-findings.csv
 |IAC File Path       |Full file path in repository where IaC issue was found               |
 |IAC Start Line      |Starting line number of the finding                                   |
 |IAC End Line        |Ending line number of the finding                                     |
+
+### Finding Identity and Location Columns (All Scan Types)
+
+These are appended after `Export Notes`, so the position of every existing column is unchanged.
+
+|Column              |Description                                                           |
+|--------------------|----------------------------------------------------------------------|
+|Finding UID         |Short, stable, tenant-wide unique ID, e.g. `SAST-3f9a1c2b7d4e8a10`. Prefix is SAST, DAST, MPT, SCA or IAC. Use this as the primary key when ingesting|
+|Finding Key         |Readable form of what the UID is built from: `<Application GUID>\|<POLICY or sandbox GUID>\|<scan type>\|<issue_id>`|
+|Module              |STATIC and MANUAL: module the flaw was found in                        |
+|Line Number         |STATIC: `file_line_number`. IaC: start line                           |
+|Procedure           |STATIC: method/function containing the flaw                           |
+|Vulnerable Parameter|DYNAMIC: the parameter that was attacked                              |
+|Component ID        |SCA: Veracode component ID                                            |
+|Location Detail     |One readable string per scan type. STATIC: `module \| full/file/path:line \| in procedure`. DYNAMIC: `URL \| param=x`. MANUAL: `module \| location \| vector=x`. SCA: `file version \| path=...`. IaC: `file (Lines a-b)`|
+
+**Why the UID is built this way**
+
+- Veracode's `issue_id` is unique only inside one application, so the application GUID is part of the key. Issue 101 in App A and issue 101 in App B get different UIDs.
+- The same `issue_id` is reported once in the policy context and once per sandbox, so the context is part of the key. The sandbox GUID is used rather than its name so renaming a sandbox does not change the UID.
+- The raw API scan type (STATIC, DYNAMIC, MANUAL, SCA) is used, not the display label, so "SCA Agent" vs "SCA" display logic never changes a UID.
+- `issue_id` is kept by Veracode across rescans, so a finding keeps the same UID from one export to the next. This makes the UID safe to upsert on.
+- IaC has no platform `issue_id` (its Issue ID column is the rule or CVE id, which repeats). IaC identity is built from file path(s), line span, rule id, finding id and type. `scan_id` is excluded so the UID is stable across scans. An unmatched IaC asset uses `iac-asset:<name>` instead of the per-scan placeholder Application ID.
+- The digest is SHA-256 truncated to 64 bits. It is a deterministic identifier, not a security control.
+
+Rows sharing a Finding UID are reported in the run summary under DUPLICATE ANALYSIS. For API scan types these are true API duplicates (use `--dedup`). For IaC they are the same finding repeated across several scans of one asset.
 
 **Note:** IAC-specific columns are blank for non-IaC findings. Standard columns may be blank for IaC findings (e.g., CVE ID, CVSS, Fixed Date, Days to Resolve, Resolution Status, Resolution).
 

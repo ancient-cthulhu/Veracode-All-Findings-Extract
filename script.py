@@ -12,6 +12,7 @@ import argparse
 import base64
 import csv
 import datetime as dt
+import hashlib
 import html
 import json
 import os
@@ -119,7 +120,38 @@ CSV_FIELDNAMES: list[str] = [
     "Issue ID",
     "Violates Policy",
     "Export Notes",
+    # --- Finding identity and location (appended so existing column
+    # positions are unchanged for consumers that read by position) ---
+    "Finding UID",
+    "Finding Key",
+    "Module",
+    "Line Number",
+    "Procedure",
+    "Vulnerable Parameter",
+    "Component ID",
+    "Location Detail",
 ]
+
+# Finding identity
+# ----------------
+# Veracode's issue_id is only unique inside one application, and the same
+# issue_id is reported once per context (policy and each sandbox). A key
+# that is unique across the whole tenant therefore needs all four of:
+#   application GUID | context (POLICY or sandbox GUID) | scan type | issue_id
+# The sandbox GUID is used rather than its name because names can be renamed.
+# The raw API scan_type (STATIC, DYNAMIC, MANUAL, SCA) is used rather than the
+# display label ("SCA Agent", "Dynamic Analysis") so the key does not change
+# if a display rule changes.
+CONTEXT_POLICY = "POLICY"
+CONTEXT_IAC = "IAC"
+UID_HEX_LEN = 16  # 64 bits: ~3e-6 collision odds at 10 million rows
+UID_PREFIX: dict[str, str] = {
+    "STATIC": "SAST",
+    "DYNAMIC": "DAST",
+    "MANUAL": "MPT",
+    "SCA": "SCA",
+    "IAC": "IAC",
+}
 
 RECON_FIELDNAMES: list[str] = [
     "Application Name",
@@ -665,6 +697,161 @@ def _extract_mitigation_comments(finding: dict[str, Any]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Finding Identity and Location
+# ---------------------------------------------------------------------------
+
+def _s(value: Any) -> str:
+    """Stringify for keys: None becomes '', whitespace is trimmed."""
+    return "" if value is None else str(value).strip()
+
+
+def _blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def build_finding_identity(
+    app_key: Any, context: Any, scan_type: Any, identity: Any,
+) -> tuple[str, str]:
+    """Return ``(finding_uid, finding_key)`` for one finding.
+
+    finding_key is the readable form, e.g.
+    ``<app-guid>|POLICY|STATIC|1042``. finding_uid is a short, fixed-length
+    digest of the same parts with a scan-type prefix, e.g.
+    ``SAST-3f9a1c2b7d4e8a10``, which is easier to filter on in Excel and to
+    use as a primary key downstream.
+
+    The digest is taken over a JSON array of the parts, not the joined
+    string, so a '|' inside a component (a file path, say) cannot make two
+    different findings hash to the same value.
+    """
+    parts = [_s(app_key), _s(context) or CONTEXT_POLICY,
+             _s(scan_type).upper() or "UNKNOWN", _s(identity)]
+    key = "|".join(parts)
+    digest = hashlib.sha256(
+        json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:UID_HEX_LEN]
+    prefix = UID_PREFIX.get(parts[2], "UNK")
+    return f"{prefix}-{digest}", key
+
+
+def _sca_component_path(details: dict[str, Any]) -> Optional[str]:
+    """Flatten SCA component_path, which may be a list of dicts or strings."""
+    raw = details.get("component_path")
+    if not raw:
+        return None
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list):
+        paths = []
+        for item in raw:
+            if isinstance(item, dict):
+                p = item.get("path")
+                if p:
+                    paths.append(str(p))
+            elif item:
+                paths.append(str(item))
+        return ", ".join(paths) or None
+    return None
+
+
+def extract_location(details: dict[str, Any], scan_type: Optional[str]) -> dict[str, Any]:
+    """Pull the fields that tell two otherwise identical-looking findings apart.
+
+    SAST rows with the same CWE in the same file previously looked
+    identical in the CSV because only file_name was exported. Line number,
+    module, full path and procedure are what differ between them. Every key
+    is read with .get(), so a field the API omits leaves the cell blank
+    rather than failing the row.
+    """
+    out: dict[str, Any] = {
+        "Module": None,
+        "Line Number": None,
+        "Procedure": None,
+        "Vulnerable Parameter": None,
+        "Component ID": None,
+        "Location Detail": None,
+    }
+    parts: list[str] = []
+
+    if scan_type == "STATIC":
+        module = details.get("module")
+        path = details.get("file_path") or details.get("file_name")
+        line = details.get("file_line_number")
+        proc = details.get("procedure")
+        out["Module"] = module or None
+        out["Line Number"] = None if _blank(line) else line
+        out["Procedure"] = proc or None
+        if module:
+            parts.append(str(module))
+        if path:
+            parts.append(f"{path}:{line}" if not _blank(line) else str(path))
+        if proc:
+            parts.append(f"in {proc}")
+
+    elif scan_type == "DYNAMIC":
+        url = details.get("URL") or details.get("url")
+        if not url:
+            host = details.get("hostname")
+            port = details.get("port")
+            path = details.get("path")
+            if host:
+                url = f"{host}:{port}" if port else str(host)
+                if path:
+                    url += path if str(path).startswith("/") else f"/{path}"
+            elif path:
+                url = str(path)
+        param = details.get("vulnerable_parameter")
+        out["Vulnerable Parameter"] = param or None
+        if url:
+            parts.append(str(url))
+        if param:
+            parts.append(f"param={param}")
+
+    elif scan_type == "MANUAL":
+        module = details.get("module")
+        location = details.get("location")
+        vector = details.get("input_vector")
+        out["Module"] = module or None
+        for v in (module, location):
+            if v:
+                parts.append(str(v))
+        if vector:
+            parts.append(f"vector={vector}")
+
+    elif scan_type == "SCA":
+        comp_id = details.get("component_id")
+        fname = details.get("component_filename")
+        version = details.get("version")
+        cpath = _sca_component_path(details)
+        out["Component ID"] = comp_id or None
+        if fname:
+            parts.append(f"{fname} {version}" if version else str(fname))
+        elif version:
+            parts.append(str(version))
+        if cpath:
+            parts.append(f"path={cpath}")
+
+    out["Location Detail"] = " | ".join(parts) or None
+    return out
+
+
+def _content_identity(details: dict[str, Any], scan_type: Optional[str]) -> str:
+    """Fallback identity when a finding arrives without an issue_id.
+
+    Not expected for Findings API data, but a blank issue_id would otherwise
+    collapse every such finding in an app onto one UID.
+    """
+    loc = extract_location(details, scan_type)
+    bits = [
+        _s(_extract_cwe_id(details)),
+        _s(_extract_cve_id(details)),
+        _s(loc.get("Component ID")),
+        _s(loc.get("Location Detail")),
+    ]
+    return "content:" + "~".join(bits)
+
+
+# ---------------------------------------------------------------------------
 # Date Helpers
 # ---------------------------------------------------------------------------
 
@@ -833,7 +1020,20 @@ def normalize_finding(finding: dict[str, Any]) -> dict[str, Any]:
     app_id = finding.get("_app_id")
     app_oid = finding.get("_app_oid")
 
+    issue_id = finding.get("issue_id")
+    identity = issue_id if not _blank(issue_id) else _content_identity(details, original_scan_type)
+    finding_uid, finding_key = build_finding_identity(
+        app_guid,
+        finding.get("_sandbox_guid") or CONTEXT_POLICY,
+        original_scan_type,
+        identity,
+    )
+    location = extract_location(details, original_scan_type)
+
     return {
+        **location,
+        "Finding UID": finding_uid,
+        "Finding Key": finding_key,
         "Application Name": finding.get("_app_name"),
         "Application ID": app_guid,
         "Sandbox Name": finding.get("_sandbox_name"),
@@ -870,8 +1070,16 @@ def normalize_iac_finding(
     app_name: str,
     app_guid: str,
     app_profile: Optional[dict[str, Any]],
+    app_key: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Normalise a detailed IaC finding into the common CSV schema."""
+    """Normalise a detailed IaC finding into the common CSV schema.
+
+    *app_key* is the application component of the Finding UID. For an IaC
+    asset matched to an application profile it is the application GUID. For
+    an unmatched asset the caller passes ``iac-asset:<name>`` because the
+    placeholder Application ID is the scan_id, which changes every scan and
+    would make the UID unstable.
+    """
     sev_str = str(finding.get("severity", "unknown")).lower()
     sev_level, sev_label = IAC_SEVERITY_MAP.get(sev_str, (0, "Informational"))
 
@@ -900,7 +1108,31 @@ def normalize_iac_finding(
 
     scan_id = iac_record.get("scan_id", "")
 
+    # IaC has no platform issue_id. The exported "Issue ID" is the rule or
+    # CVE id, which repeats across files and scans. Identity is therefore
+    # built from what makes the finding distinct: every file path, the line
+    # span, rule id, finding id and type. scan_id is deliberately excluded
+    # so the same finding keeps the same UID from one scan to the next.
+    all_paths = (
+        ";".join(str(p) for p in raw_path) if isinstance(raw_path, list) else _s(raw_path)
+    )
+    iac_identity = "~".join([
+        all_paths, f"{_s(start_line)}-{_s(end_line)}",
+        _s(rule_id), _s(finding_id), _s(finding_type).lower(),
+    ])
+    finding_uid, finding_key = build_finding_identity(
+        app_key or app_guid, CONTEXT_IAC, "IAC", iac_identity,
+    )
+
     return {
+        "Finding UID": finding_uid,
+        "Finding Key": finding_key,
+        "Module": None,
+        "Line Number": start_line or None,
+        "Procedure": None,
+        "Vulnerable Parameter": None,
+        "Component ID": None,
+        "Location Detail": location or None,
         "Application Name": app_name,
         "Application ID": app_guid,
         "Sandbox Name": None,
@@ -1759,6 +1991,15 @@ def safe_normalize(
                 salvage[key] = finding.get(src)
             except Exception:
                 pass
+        try:
+            salvage["Finding UID"], salvage["Finding Key"] = build_finding_identity(
+                finding.get("_app_guid"),
+                finding.get("_sandbox_guid") or CONTEXT_POLICY,
+                finding.get("scan_type"),
+                finding.get("issue_id"),
+            )
+        except Exception:
+            pass
         salvage["Export Notes"] = f"NORMALIZATION_FAILED: {type(exc).__name__}: {exc}"[:400]
         return salvage
 
@@ -1771,8 +2012,11 @@ def _sort_key(row: dict[str, Any]) -> tuple:
     """
     def s(v: Any) -> str:
         return "" if v is None else str(v)
+    # Finding UID is the final tie-breaker. IaC rows share Issue IDs (rule
+    # or CVE id), so without it their relative order was not deterministic.
     return (s(row.get("Application Name")), s(row.get("Sandbox Name")),
-            s(row.get("Scan Type")), s(row.get("Issue ID")))
+            s(row.get("Scan Type")), s(row.get("Issue ID")),
+            s(row.get("Finding UID")))
 
 
 class StreamingExporter:
@@ -1830,6 +2074,14 @@ class StreamingExporter:
         self.by_scan_type: CollCounter = CollCounter()
         self.recon_written = 0
         self._duplicate_samples: list[tuple] = []
+        # Finding UID collision tracking. For API findings a collision can
+        # only occur inside one application's batch, so a per-batch set is
+        # exact. IaC findings for one asset can span several scan records
+        # (batches), so IaC UIDs are tracked across the whole run. IaC
+        # volume is small enough that this stays cheap.
+        self.uid_collisions = 0
+        self._uid_collision_samples: list[tuple[str, str]] = []
+        self._iac_uids: set[str] = set()
         self._lock = threading.Lock()
         self._closed = False
 
@@ -1889,6 +2141,20 @@ class StreamingExporter:
                     continue
                 batch.append(row)
 
+            batch_uids: set[str] = set()
+            for row in batch:
+                uid = row.get("Finding UID")
+                if not uid:
+                    continue
+                pool = self._iac_uids if row.get("Scan Type") == "IAC" else batch_uids
+                if uid in pool:
+                    self.uid_collisions += 1
+                    if len(self._uid_collision_samples) < 20:
+                        self._uid_collision_samples.append(
+                            (uid, str(row.get("Finding Key"))))
+                else:
+                    pool.add(uid)
+
             batch.sort(key=_sort_key)
             for row in batch:
                 self._csv_writer.writerow(row)
@@ -1933,6 +2199,10 @@ class StreamingExporter:
     @property
     def duplicate_samples(self) -> list[tuple]:
         return self._duplicate_samples
+
+    @property
+    def uid_collision_samples(self) -> list[tuple[str, str]]:
+        return self._uid_collision_samples
 
 
 # ---------------------------------------------------------------------------
@@ -2297,7 +2567,9 @@ def main() -> int:
 
                         if info:
                             matched_name = info["profile"].get("name", asset)
+                            uid_app_key = info["guid"]
                         else:
+                            uid_app_key = f"iac-asset:{str(asset).strip().lower()}"
                             sid = rec.get("scan_id", asset)
                             unmatched.append(asset)
                             info = {"guid": str(sid),
@@ -2312,7 +2584,8 @@ def main() -> int:
                             try:
                                 batch.append(normalize_iac_finding(
                                     iac_finding, rec, matched_name,
-                                    info["guid"], info["profile"]))
+                                    info["guid"], info["profile"],
+                                    app_key=uid_app_key))
                             except Exception as exc:
                                 tracker.record_failure(
                                     f"normalize-iac[{matched_name}]",
@@ -2346,6 +2619,12 @@ def main() -> int:
         print(f"  --dedup active: removed {exporter.duplicates_removed} rows")
     elif exporter.duplicates_seen:
         print("  Duplicates retained (pass --dedup to remove them).")
+    print(f"  Rows sharing a Finding UID          : {exporter.uid_collisions}")
+    for uid, key in exporter.uid_collision_samples[:5]:
+        print(f"    {uid}  {key}")
+    if exporter.uid_collisions:
+        print("  Rows sharing a UID describe the same finding: API duplicates")
+        print("  (see above) or one IaC finding repeated across scans of an asset.")
     print("=" * 70)
 
     # --- Outputs ---
