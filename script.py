@@ -144,6 +144,7 @@ CSV_FIELDNAMES: list[str] = [
     "Vulnerable Parameter",
     "Component ID",
     "Location Detail",
+    "Business Unit",
 ]
 
 # Finding identity
@@ -717,19 +718,18 @@ def strip_html_tags(text: Optional[str]) -> Optional[str]:
 
 
 def _extract_team_name(app_profile: dict[str, Any]) -> Optional[str]:
-    """Extract the team/BU name from an application profile."""
-    bu = app_profile.get("business_unit")
-    if isinstance(bu, dict):
-        name = bu.get("name")
-        if name and name != "Not Specified":
-            return name
+    """All teams the application belongs to, sorted and joined with '; '."""
+    teams = app_profile.get("teams") or []
+    names = sorted({str(t.get("team_name")).strip() for t in teams
+                    if isinstance(t, dict) and t.get("team_name")})
+    return "; ".join(names) or None
 
-    teams = app_profile.get("teams", [])
-    if isinstance(teams, list) and teams:
-        first = teams[0]
-        if isinstance(first, dict):
-            return first.get("team_name")
-    return None
+
+def _extract_business_unit(app_profile: dict[str, Any]) -> Optional[str]:
+    """Business unit name, blank when unset ('Not Specified')."""
+    bu = app_profile.get("business_unit")
+    name = bu.get("name") if isinstance(bu, dict) else None
+    return name if name and name != "Not Specified" else None
 
 
 # ---------------------------------------------------------------------------
@@ -1164,6 +1164,7 @@ def normalize_finding(finding: dict[str, Any]) -> dict[str, Any]:
         "Finding Status": status,
         "Fixed Date": fixed_date,
         "Team Name": _extract_team_name(app_profile),
+        "Business Unit": _extract_business_unit(app_profile),
         "Days to Resolve": _days_between(first_found, fixed_date),
         "Scan Type": scan_type,
         "CVSS": _extract_cvss(details),
@@ -1263,6 +1264,7 @@ def normalize_iac_finding(
         "Finding Status": "OPEN",
         "Fixed Date": None,
         "Team Name": _extract_team_name(app_profile) if app_profile else None,
+        "Business Unit": _extract_business_unit(app_profile) if app_profile else None,
         "Days to Resolve": None,
         "Scan Type": "IAC",
         "CVSS": cvss or None,
