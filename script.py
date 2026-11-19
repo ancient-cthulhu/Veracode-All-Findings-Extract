@@ -12,6 +12,7 @@ import argparse
 import base64
 import csv
 import datetime as dt
+import functools
 import hashlib
 import html
 import json
@@ -28,23 +29,36 @@ from typing import Any, Optional
 
 import requests
 from veracode_api_signing.plugin_requests import RequestsAuthPluginVeracodeHMAC
-from veracode_api_py.apihelper import APIHelper
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
+# Region-dependent URLs. These are the US defaults; configure_api_base()
+# rebinds all of them at startup for EU / FedRAMP tenants.
 BASE_URL = "https://api.veracode.com"
 APPLICATIONS_URL = f"{BASE_URL}/appsec/v1/applications"
 SANDBOXES_URL_TEMPLATE = f"{BASE_URL}/appsec/v1/applications/{{app_guid}}/sandboxes"
 FINDINGS_URL_TEMPLATE = f"{BASE_URL}/appsec/v2/applications/{{app_guid}}/findings"
 SCA_API_BASE = f"{BASE_URL}/srcclr/v3"
 DYNAMIC_ANALYSES_URL = f"{BASE_URL}/was/configservice/v1/analyses"
+PRINCIPAL_URL = f"{BASE_URL}/api/authn/v2/principal"
 ANALYSIS_CENTER_BASE = "https://analysiscenter.veracode.com/auth/index.jsp"
+WEB_UI_BASE = "https://web.analysiscenter.veracode.com"
+SCA_UI_BASE = "https://sca.analysiscenter.veracode.com"
 
-# 500 is the documented safe maximum for Veracode REST collection endpoints.
+# API host per region character (7th char of the API ID prefix, e.g. vera01ei-).
+REGION_API_BASES: dict[str, str] = {
+    "e": "https://api.veracode.eu",
+    "f": "https://api.veracode.us",
+    "g": "https://api.veracode.com",
+}
+
+# 500 is the documented maximum page size for the Findings API.
 DEFAULT_PAGE_SIZE = 500
+MAX_PAGE_SIZE = 500
+DEFAULT_REQUEST_TIMEOUT = 120
 NON_SCA_SCAN_TYPES = ("STATIC", "DYNAMIC", "MANUAL")
 MAX_ERROR_BODY_LOG = 500
 
@@ -177,6 +191,74 @@ def _parse_requested_scan_types(scan_type_str: Optional[str]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Credentials and Region
+# ---------------------------------------------------------------------------
+
+def apply_credential_aliases() -> None:
+    """Copy VERACODE_API_ID / VERACODE_API_KEY onto the names the signing
+    library reads, without overwriting values that are already set."""
+    for src, dst in (("VERACODE_API_ID", "VERACODE_API_KEY_ID"),
+                     ("VERACODE_API_KEY", "VERACODE_API_KEY_SECRET")):
+        if os.environ.get(src) and not os.environ.get(dst):
+            os.environ[dst] = os.environ[src]
+
+
+def api_base_for_key_id(api_key_id: Optional[str]) -> str:
+    """Pick the API host from the 7th character of the API ID prefix."""
+    if api_key_id and "-" in api_key_id:
+        prefix = api_key_id.split("-", 1)[0]
+        if len(prefix) >= 7:
+            return REGION_API_BASES.get(prefix[6].lower(), REGION_API_BASES["g"])
+    return REGION_API_BASES["g"]
+
+
+def resolve_api_base() -> str:
+    """VERACODE_API_BASE wins; otherwise derive the region from the API ID
+    (environment first, then ~/.veracode/credentials). Never logs the ID."""
+    override = os.environ.get("VERACODE_API_BASE", "").strip().rstrip("/")
+    if override:
+        return override if "://" in override else f"https://{override}"
+    key_id = os.environ.get("VERACODE_API_KEY_ID")
+    if not key_id:
+        try:
+            from veracode_api_signing.credentials import get_credentials
+            key_id = get_credentials()[0]
+        except Exception:  # noqa: BLE001 - best effort; signing reports the real error later
+            key_id = None
+    return api_base_for_key_id(key_id)
+
+
+def configure_api_base(api_base: str) -> None:
+    """Rebind every region-dependent URL for *api_base*.
+
+    The UI hosts share the API host's top-level domain (com / eu / us).
+    """
+    global BASE_URL, APPLICATIONS_URL, SANDBOXES_URL_TEMPLATE
+    global FINDINGS_URL_TEMPLATE, SCA_API_BASE, DYNAMIC_ANALYSES_URL
+    global PRINCIPAL_URL, ANALYSIS_CENTER_BASE, WEB_UI_BASE, SCA_UI_BASE
+    global IAC_API_BASE, IAC_SCANS_URL, IAC_FINDINGS_URL_TEMPLATE
+
+    BASE_URL = api_base.rstrip("/")
+    APPLICATIONS_URL = f"{BASE_URL}/appsec/v1/applications"
+    SANDBOXES_URL_TEMPLATE = f"{BASE_URL}/appsec/v1/applications/{{app_guid}}/sandboxes"
+    FINDINGS_URL_TEMPLATE = f"{BASE_URL}/appsec/v2/applications/{{app_guid}}/findings"
+    SCA_API_BASE = f"{BASE_URL}/srcclr/v3"
+    DYNAMIC_ANALYSES_URL = f"{BASE_URL}/was/configservice/v1/analyses"
+    PRINCIPAL_URL = f"{BASE_URL}/api/authn/v2/principal"
+
+    host = BASE_URL.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+    tld = host.rsplit(".", 1)[-1].lower()
+    if tld not in ("com", "eu", "us"):
+        tld = "com"
+    ANALYSIS_CENTER_BASE = f"https://analysiscenter.veracode.{tld}/auth/index.jsp"
+    WEB_UI_BASE = f"https://web.analysiscenter.veracode.{tld}"
+    SCA_UI_BASE = f"https://sca.analysiscenter.veracode.{tld}"
+    IAC_API_BASE = f"https://ui.analysiscenter.veracode.{tld}/container-scan-query/v1"
+    IAC_SCANS_URL = f"{IAC_API_BASE}/scans"
+    IAC_FINDINGS_URL_TEMPLATE = f"{IAC_API_BASE}/scans/{{scan_id}}/findings"
+
+
+# ---------------------------------------------------------------------------
 # Failure Tracking
 # ---------------------------------------------------------------------------
 
@@ -263,6 +345,26 @@ def create_session(ca_cert: Optional[str] = None, use_hmac: bool = True) -> requ
         session.verify = ca_cert
     if use_hmac:
         session.auth = RequestsAuthPluginVeracodeHMAC()
+    return session
+
+
+_THREAD_LOCAL = threading.local()
+
+
+def _thread_session(ca_cert: Optional[str] = None, use_hmac: bool = True) -> requests.Session:
+    """Return a Session owned by the calling thread, creating it once.
+
+    requests.Session is not documented as thread-safe, so each worker gets
+    its own; reusing it across applications keeps the TLS connection alive
+    instead of opening a new one per app.
+    """
+    cache = getattr(_THREAD_LOCAL, "sessions", None)
+    if cache is None:
+        cache = _THREAD_LOCAL.sessions = {}
+    key = (ca_cert, use_hmac)
+    session = cache.get(key)
+    if session is None:
+        session = cache[key] = create_session(ca_cert=ca_cert, use_hmac=use_hmac)
     return session
 
 
@@ -380,6 +482,8 @@ def request_with_retry(
     if max_attempts is None:
         max_attempts = DEFAULT_MAX_ATTEMPTS
     max_attempts = max(1, max_attempts)
+    # requests has no default timeout; a stalled socket would hang a worker.
+    kwargs.setdefault("timeout", DEFAULT_REQUEST_TIMEOUT)
 
     for attempt in range(1, max_attempts + 1):
         if rate_limiter:
@@ -518,6 +622,12 @@ def paginate(
             timeout=timeout,
         )
         if resp.status_code == 404:
+            if page > 0:
+                # A later page vanishing is not 'no data': the earlier pages
+                # said more existed. Fail the context instead of truncating.
+                raise FetchError(
+                    f"{scope} page {page}: HTTP 404 mid-walk after "
+                    f"{len(records)} records")
             break
 
         try:
@@ -862,6 +972,12 @@ def _days_between(start_iso: Optional[str], end_iso: Optional[str]) -> Optional[
     try:
         s = dt.datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
         e = dt.datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+        # Mixed offset-aware / naive values cannot be subtracted; treat a
+        # missing offset as UTC instead of silently returning None.
+        if s.tzinfo is None:
+            s = s.replace(tzinfo=dt.timezone.utc)
+        if e.tzinfo is None:
+            e = e.replace(tzinfo=dt.timezone.utc)
         return (e - s).days
     except (ValueError, TypeError, AttributeError):
         return None
@@ -944,7 +1060,7 @@ def _link_dynamic(
     if finding_obj:
         da_id = finding_obj.get("_dynamic_analysis_id")
         if da_id:
-            return f"https://web.analysiscenter.veracode.com/was/#/analysis/{da_id}/scans"
+            return f"{WEB_UI_BASE}/was/#/analysis/{da_id}/scans"
         dast_url = finding_obj.get("_dast_scan_url")
         if dast_url:
             return f"{base}#{dast_url}"
@@ -967,8 +1083,8 @@ def _link_sca(
                 ws = ws or finding_obj.get("_sca_workspace_guid") or finding_obj.get("workspace_guid")
                 pid = pid or finding_obj.get("_sca_project_id") or finding_obj.get("project_id")
             if ws and pid:
-                return f"https://sca.analysiscenter.veracode.com/workspaces/{ws}/projects/{pid}/issues"
-            return "https://sca.analysiscenter.veracode.com/workspaces"
+                return f"{SCA_UI_BASE}/workspaces/{ws}/projects/{pid}/issues"
+            return f"{SCA_UI_BASE}/workspaces"
 
     scan_params = (finding_obj or {}).get("_latest_scan_params")
     if scan_params and app_oid and app_id:
@@ -1154,7 +1270,7 @@ def normalize_iac_finding(
         "Resolution Status": None,
         "Resolution": None,
         "Veracode Link": (
-            f"https://web.analysiscenter.veracode.com/app/container-iac-scans/{scan_id}/summary"
+            f"{WEB_UI_BASE}/app/container-iac-scans/{scan_id}/summary"
             if scan_id else None
         ),
         "Mitigation Comments": suggested_fix or None,
@@ -1574,7 +1690,7 @@ def _process_application(
     ca_cert: Optional[str] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Fetch and enrich findings for one application (thread worker)."""
-    session = create_session(ca_cert=ca_cert)
+    session = _thread_session(ca_cert=ca_cert)
     profile = app.get("profile") or {}
     app_guid = app.get("guid")
     app_name = profile.get("name", "Unknown")
@@ -1588,7 +1704,7 @@ def _process_application(
         dast_url_by_build: dict[int, str] = {}
         latest_scan_params: Optional[str] = None
 
-        for scan in app.get("scans", []):
+        for scan in app.get("scans") or []:
             scan_url = scan.get("scan_url", "")
             if not scan_url:
                 continue
@@ -1655,22 +1771,31 @@ def _process_application(
             "Status": "FAILED",
             "Detail": f"{type(exc).__name__}: {exc}"[:300],
         }]
-    finally:
-        session.close()
 
 
 # ---------------------------------------------------------------------------
 # IaC Live Fetching (principal token auth)
 # ---------------------------------------------------------------------------
 
-def _get_principal_token() -> str:
-    """Get a session token via HMAC-authenticated principal API call."""
-    try:
-        principal = APIHelper()._rest_request("api/authn/v2/principal", "GET")
-    except Exception as exc:
-        raise RuntimeError(f"Failed to retrieve principal token: {exc}") from exc
+def _get_principal_token(ca_cert: Optional[str] = None) -> str:
+    """Get a session token via an HMAC-signed principal API call.
 
-    if not isinstance(principal, dict) or "token" not in principal:
+    Uses this script's own session so the call honours --ca-cert, the
+    resolved region, the request timeout and the retry policy.
+    """
+    session = create_session(ca_cert=ca_cert)
+    try:
+        resp = request_with_retry(
+            session, PRINCIPAL_URL, scope="principal",
+            passthrough_statuses=(), timeout=60,
+        )
+        principal = resp.json()
+    except (FetchError, ValueError) as exc:
+        raise RuntimeError(f"Failed to retrieve principal token: {exc}") from exc
+    finally:
+        session.close()
+
+    if not isinstance(principal, dict) or not principal.get("token"):
         raise RuntimeError(
             f"Unexpected principal response type: {type(principal).__name__}"
         )
@@ -1692,32 +1817,35 @@ class IacTokenProvider:
     at the same time trigger exactly one refresh between them.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, ca_cert: Optional[str] = None) -> None:
         self._lock = threading.Lock()
         self._token: Optional[str] = None
-        self._generation = 0
+        self._ca_cert = ca_cert
         self.refreshes = 0
 
     def get(self) -> str:
         with self._lock:
             if self._token is None:
-                self._token = _get_principal_token()
-                self._generation += 1
+                self._token = _get_principal_token(self._ca_cert)
             return self._token
 
     def headers(self) -> dict[str, str]:
         return _iac_auth_header(self.get())
 
-    def refresh(self) -> dict[str, str]:
-        """Mint a new token and return replacement headers."""
+    def refresh(self, stale_headers: Optional[dict[str, str]] = None) -> dict[str, str]:
+        """Mint a new token and return replacement headers.
+
+        *stale_headers* are the headers the failed request used. If the
+        current token already differs, another thread refreshed while this
+        one waited, so its token is reused instead of minting again.
+        """
         with self._lock:
-            seen = self._generation
-            # Another thread may have refreshed while this one waited.
-            if seen == self._generation:
-                self._token = _get_principal_token()
-                self._generation += 1
-                self.refreshes += 1
-            return _iac_auth_header(self._token or "")
+            if (stale_headers is not None and self._token is not None
+                    and stale_headers != _iac_auth_header(self._token)):
+                return _iac_auth_header(self._token)
+            self._token = _get_principal_token(self._ca_cert)
+            self.refreshes += 1
+            return _iac_auth_header(self._token)
 
 
 def _paginate_iac(
@@ -1744,18 +1872,25 @@ def _paginate_iac(
         params = dict(extra_params or {})
         params.update({"page": page, "limit": IAC_MAX_RECORDS})
 
+        headers = tokens.headers()
         resp = request_with_retry(
             session, url,
             scope=f"{scope} page {page}",
             rate_limiter=rate_limiter,
             tracker=tracker,
-            headers=tokens.headers(),
+            headers=headers,
             params=params,
             timeout=90,
             passthrough_statuses=(404,),
-            auth_refresh=tokens.refresh,
+            # Pass the headers this request used so concurrent 401s share
+            # one refresh instead of each minting a new token.
+            auth_refresh=functools.partial(tokens.refresh, headers),
         )
         if resp.status_code == 404:
+            if page > 0:
+                raise FetchError(
+                    f"{scope} page {page}: HTTP 404 mid-walk after "
+                    f"{len(all_records)} records")
             break
 
         try:
@@ -1832,7 +1967,7 @@ def _process_iac_scan(
         tracker.record_failure(f"iac-scan[{asset_name}]", "record has no scan_id")
         return record
 
-    session = create_session(ca_cert=ca_cert, use_hmac=False)
+    session = _thread_session(ca_cert=ca_cert, use_hmac=False)
     try:
         findings = _paginate_iac(
             session, IAC_FINDINGS_URL_TEMPLATE.format(scan_id=scan_id), tokens, "findings",
@@ -1845,8 +1980,6 @@ def _process_iac_scan(
         tracker.record_failure(f"iac-findings[{asset_name}:{scan_id}]", str(exc))
         print(f"    FAILED IaC findings for {asset_name} (scan {scan_id}): {exc}")
         findings = []
-    finally:
-        session.close()
 
     detailed_record = record.copy()
     detailed_record["detailed_findings"] = findings
@@ -1863,7 +1996,7 @@ def _fetch_iac_data_live(
 ) -> list[dict[str, Any]]:
     """Fetch IaC scan data live via principal token auth."""
     print("  Obtaining principal token via HMAC auth...")
-    tokens = IacTokenProvider()
+    tokens = IacTokenProvider(ca_cert=ca_cert)
     try:
         tokens.get()
         print("  Principal token obtained (auto-refreshes on 401)\n")
@@ -1927,29 +2060,12 @@ def _finding_key(row: dict[str, Any]) -> tuple:
     )
 
 
-def analyse_duplicates(raw_findings: list[dict]) -> tuple[int, list[tuple]]:
-    """Count exact duplicate finding identities. Purely diagnostic."""
-    keys = [_finding_key(f) for f in raw_findings if isinstance(f, dict) and "issue_id" in f]
-    counts = CollCounter(keys)
-    dupes = [(k, c) for k, c in counts.items() if c > 1]
-    total_extra = sum(c - 1 for _, c in dupes)
-    return total_extra, dupes[:20]
-
-
-def apply_status_filter(rows: list[dict], status: Optional[str]) -> list[dict]:
-    """Apply the status filter client-side.
-
-    'status' is not a documented Findings API query parameter, so filtering
-    server-side was unreliable. This filters the normalised rows instead.
-    """
-    if not status:
-        return rows
-    want = status.upper()
-    return [r for r in rows if str(r.get("Finding Status", "")).upper() == want]
-
-
 def _row_passes_status(row: dict, status: Optional[str]) -> bool:
-    """Single-row form of the status filter, for the streaming path."""
+    """Apply the --status filter to one normalised row.
+
+    'status' is not a documented Findings API query parameter, so the
+    filter is applied client-side.
+    """
     if not status:
         return True
     return str(row.get("Finding Status", "")).upper() == status.upper()
@@ -2209,7 +2325,7 @@ class StreamingExporter:
 # CLI
 # ---------------------------------------------------------------------------
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Export Veracode FINDINGS data via Findings REST API.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2258,7 +2374,7 @@ def _parse_args() -> argparse.Namespace:
                    help="Drop duplicate finding identities. Duplicates are always "
                         "reported regardless of this flag.")
     p.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE,
-                   help=f"Findings page size (default: {DEFAULT_PAGE_SIZE}).")
+                   help=f"Findings page size, 1-{MAX_PAGE_SIZE} (default: {DEFAULT_PAGE_SIZE}).")
     p.add_argument("--sleep", type=float, default=0.0,
                    help="Extra sleep between API pages (default: 0.0; the rate "
                         "limiter already paces requests).")
@@ -2275,7 +2391,17 @@ def _parse_args() -> argparse.Namespace:
                    help="Path to custom CA certificate bundle (.pem).")
     p.add_argument("--ignore-failures", action="store_true", default=False,
                    help="Exit 0 even when requests failed. Not recommended.")
-    return p.parse_args()
+    args = p.parse_args(argv)
+    # Reject values that would otherwise fail deep in the run: a page size
+    # above the Findings API maximum, a zero pool, or a zero rate (which
+    # divides by zero in the rate limiter).
+    if not 1 <= args.page_size <= MAX_PAGE_SIZE:
+        p.error(f"--page-size must be between 1 and {MAX_PAGE_SIZE}")
+    if args.max_workers < 1:
+        p.error("--max-workers must be at least 1")
+    if args.rate_limit <= 0:
+        p.error("--rate-limit must be greater than 0")
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -2284,6 +2410,9 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+
+    apply_credential_aliases()
+    configure_api_base(resolve_api_base())
 
     global DEFAULT_MAX_ATTEMPTS  # noqa: PLW0603
     DEFAULT_MAX_ATTEMPTS = max(1, args.max_attempts)
@@ -2320,12 +2449,17 @@ def main() -> int:
 
     fetch_api_findings = not requested_types or bool(set(requested_types) & API_SCAN_TYPES)
     fetch_iac = not requested_types or "IAC" in requested_types
+    # The SCA workspace and Dynamic Analysis lookups only build deep links for
+    # their own scan type; skip their tenant-wide fan-out when not requested.
+    fetch_sca_links = not requested_types or "SCA" in requested_types
+    fetch_da_links = not requested_types or "DYNAMIC" in requested_types
     include_annotations = not args.no_annotations
 
     # --- Banner ---
     print("\n" + "=" * 70)
     print("  VERACODE FINDINGS API EXPORT")
     print("=" * 70)
+    print(f"  API Base          : {BASE_URL}")
     print(f"  Output File       : {args.output}")
     print(f"  Include Sandboxes : {args.include_sandbox}")
     print(f"  Include Annotations: {include_annotations}")
@@ -2359,13 +2493,14 @@ def main() -> int:
 
     session = create_session(ca_cert=args.ca_cert)
     try:
-        if fetch_api_findings:
+        if fetch_api_findings and fetch_sca_links:
             print("=" * 70)
             print("  FETCHING SCA WORKSPACE MAPPINGS")
             print("=" * 70)
             sca_map = get_sca_workspaces(session, args.sleep, rate_limiter, tracker)
             print("=" * 70 + "\n")
 
+        if fetch_api_findings and fetch_da_links:
             print("=" * 70)
             print("  FETCHING DYNAMIC ANALYSIS MAPPINGS")
             print("=" * 70)
@@ -2443,7 +2578,7 @@ def main() -> int:
 
     # --- Phase 3: Fetch findings concurrently, streaming to disk ---
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    recon_path = args.output.rsplit(".", 1)[0] + f"_reconciliation_{timestamp}.csv"
+    recon_path = os.path.splitext(args.output)[0] + f"_reconciliation_{timestamp}.csv"
     raw_path = (f"veracode_findings_api_raw_{timestamp}.jsonl"
                 if args.raw_json else None)
 
@@ -2451,7 +2586,6 @@ def main() -> int:
     apps_ok = 0
     apps_failed = 0
     findings_retrieved = 0
-    published = False
 
     exporter = StreamingExporter(
         csv_path=args.output,
@@ -2535,6 +2669,13 @@ def main() -> int:
                 iac_filter_set: Optional[set[str]] = None
                 if args.app_name:
                     iac_filter_set = {n.strip() for n in args.app_name.split(",") if n.strip()}
+                elif args.app_guid:
+                    # A single-app run must not export every IaC asset in
+                    # the tenant; match IaC assets to the resolved app name.
+                    iac_filter_set = {
+                        (a.get("profile") or {}).get("name", "")
+                        for a in applications
+                    } - {""} or {args.app_guid}
 
                 iac_records = _fetch_iac_data_live(
                     rate_limiter=rate_limiter,
@@ -2602,7 +2743,6 @@ def main() -> int:
                 else:
                     print("  No IaC scan data found.\n")
 
-        published = True
     except KeyboardInterrupt:
         print("\n\n  INTERRUPTED by user. The destination file was not modified.")
         return 130
