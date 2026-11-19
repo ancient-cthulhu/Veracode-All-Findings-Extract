@@ -26,9 +26,13 @@ veracode_api_key_id = YOUR_API_KEY_ID
 veracode_api_key_secret = YOUR_API_KEY_SECRET
 ```
 
+Or set environment variables `VERACODE_API_ID` and `VERACODE_API_KEY` (the older `VERACODE_API_KEY_ID` / `VERACODE_API_KEY_SECRET` names also work).
+
+**Region:** detected from the API ID (US `api.veracode.com`, EU `api.veracode.eu`, FedRAMP `api.veracode.us`). Override with `VERACODE_API_BASE`.
+
 **Python packages:**
 ```bash
-pip install requests veracode-api-signing veracode-api-py
+pip install -r requirements.txt
 ```
 
 ## Quick Start
@@ -55,7 +59,7 @@ After any run, check the reconciliation CSV for rows where Status is not `OK`.
 |-------------------|--------|-----------------------------------------------------|
 |`--output`         |`veracode_findings_api.csv`|Output CSV filename               |
 |`--app-name`       |None    |Comma-separated app names (exact match)              |
-|`--app-guid`       |None    |Single application GUID                              |
+|`--app-guid`       |None    |Single application GUID (IaC limited to that app)    |
 |`--scan-type`      |All     |STATIC, DYNAMIC, MANUAL, SCA, IAC (comma-separated)  |
 |`--severity`       |None    |Exact severity (0-5)                                 |
 |`--severity-gte`   |None    |Minimum severity (0-5)                               |
@@ -80,7 +84,7 @@ After any run, check the reconciliation CSV for rows where Status is not `OK`.
 |-------------------|--------|-----------------------------------------------------|
 |`--rate-limit`     |3.5     |Requests/sec (210/min, under Veracode's 250/min)     |
 |`--max-workers`    |5       |Concurrent threads                                   |
-|`--page-size`      |500     |Records per page                                     |
+|`--page-size`      |500     |Records per page (1-500)                             |
 |`--max-attempts`   |6       |Retries per request                                  |
 |`--sleep`          |0.0     |Extra delay between pages (rarely needed)            |
 |`--combine-scan-types`|False|One call for STATIC,DYNAMIC,MANUAL. Undocumented by Veracode, verify counts|
@@ -179,7 +183,7 @@ Rows sharing a UID are listed in the run summary: API duplicates (remove with `-
 ## How It Works
 
 1. **Setup:** validates credentials, creates pooled HTTP sessions, starts the rate limiter.
-2. **Lookups:** fetches all application profiles (paginated), SCA workspace/project mappings and Dynamic Analysis mappings (both used for deep links only, never for which findings are retrieved). Applies `--app-name` / `--app-guid`.
+2. **Lookups:** fetches all application profiles (paginated), SCA workspace/project mappings and Dynamic Analysis mappings (both used for deep links only, never for which findings are retrieved, and skipped when `--scan-type` excludes SCA / DYNAMIC). Applies `--app-name` / `--app-guid`.
 3. **Findings per app (concurrent):**
    - Policy scan: one request per scan type (STATIC, DYNAMIC, MANUAL). Single values are the only documented form.
    - SCA: always a separate request (Veracode does not support combining it).
@@ -214,8 +218,8 @@ For a full tenant extract including closed and mitigated findings, consider the 
 |Problem                     |Check                                                            |
 |----------------------------|-----------------------------------------------------------------|
 |401/403                     |Credentials file location and format, account role (see Prerequisites)|
-|IaC auth failed             |Account has Container Security access, `veracode-api-py` installed. Token comes from `/api/authn/v2/principal` and auto-refreshes|
-|0 applications              |User accounts only see their teams' apps (service accounts see all). Check API region (US/EU). Test with `--max-apps 5`|
+|IaC auth failed             |Account has Container Security access. Token comes from `/api/authn/v2/principal` and auto-refreshes|
+|0 applications              |User accounts only see their teams' apps (service accounts see all). Check the `API Base` line in the banner matches your region (set `VERACODE_API_BASE` if not). Test with `--max-apps 5`|
 |429s persist                |Lower `--rate-limit` and `--max-workers`, no parallel runs on the same account|
 |Run INCOMPLETE              |Filter reconciliation CSV: `FAILED` = request failed after all retries, `MISMATCH` = API total differs from retrieved (data changed mid-run or throttling). Re-run with lower rate|
 |Fewer findings than platform|`--include-sandbox`, reconciliation failures, API Limitations above|
