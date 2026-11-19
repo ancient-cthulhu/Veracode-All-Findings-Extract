@@ -139,7 +139,7 @@ Fetched on every run unless excluded with `--scan-type`. No browser cookies need
 |Filename/Class      |File (STATIC), URL (DYNAMIC), component (SCA), file and lines (IaC)|
 |Finding Status      |OPEN or CLOSED. IaC: always OPEN                                 |
 |Fixed Date / Days to Resolve|Only when CLOSED or FIXED                                |
-|Team Name           |Business unit or first team                                      |
+|Team Name           |All teams the application belongs to, joined with `; `           |
 |Scan Type           |STATIC, DAST, Dynamic Analysis, MANUAL, SCA, SCA Agent, IAC      |
 |CVSS                |Prefers v3                                                       |
 |Resolution Status / Resolution|Platform mitigation state (e.g. APPROVED, FALSE POSITIVE)|
@@ -162,6 +162,7 @@ Fetched on every run unless excluded with `--scan-type`. No browser cookies need
 |Vulnerable Parameter|DYNAMIC                                                          |
 |Component ID        |SCA                                                              |
 |Location Detail     |e.g. `app.war \| src/UserDao.java:42 \| in findUser`, `https://host/search \| param=q`|
+|Business Unit       |Application business unit (blank when Not Specified)            |
 
 **How the UID is built:** `<prefix>-` + first 16 hex chars of SHA-256 over:
 
