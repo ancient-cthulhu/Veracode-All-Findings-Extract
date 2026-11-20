@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - os: windows-latest
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: pip install --no-deps -r requirements.txt
+      - name: Smoke test
+        run: python script.py --help
+      - name: Lint
+        run: pipx run ruff check --select E4,E7,E9,F script.py
+      - name: Security lint
+        run: pipx run bandit -q -ll script.py
+      - name: Dependency audit
+        # Audit exactly what was installed (--no-deps), not httpie and friends
+        # that veracode-api-signing declares but the script never imports.
+        run: |
+          pip freeze > installed.txt
+          pipx run pip-audit -r installed.txt --no-deps --disable-pip
