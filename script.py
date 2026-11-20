@@ -21,11 +21,13 @@ import random
 import re
 import itertools
 import sys
+import tempfile
 import threading
 import time
 from collections import Counter as CollCounter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 import requests
 from veracode_api_signing.plugin_requests import RequestsAuthPluginVeracodeHMAC
@@ -58,15 +60,55 @@ REGION_API_BASES: dict[str, str] = {
 # 500 is the documented maximum page size for the Findings API.
 DEFAULT_PAGE_SIZE = 500
 MAX_PAGE_SIZE = 500
-DEFAULT_REQUEST_TIMEOUT = 120
+# (connect, read) seconds. A short connect timeout fails fast on an
+# unreachable host or proxy; the read timeout covers slow large pages.
+CONNECT_TIMEOUT = 10
+DEFAULT_REQUEST_TIMEOUT = (CONNECT_TIMEOUT, 120)
 NON_SCA_SCAN_TYPES = ("STATIC", "DYNAMIC", "MANUAL")
+# Policy-context scan types requested only when the application's scans list
+# (Applications API, scan_type enum STATIC/DYNAMIC/MANUAL/SCA) contains them.
+POLICY_SKIPPABLE_SCAN_TYPES = frozenset({"DYNAMIC", "MANUAL"})
+# Reconciliation statuses that do not make an application incomplete.
+RECON_OK_STATUSES = frozenset({"OK", "SKIPPED"})
 MAX_ERROR_BODY_LOG = 500
+
+# Findings API query parameters the spec marks "Not valid for the SCA scan
+# type" / "Does not apply to the SCA scan type". They are never sent on a
+# scan_type=SCA request; --violates-policy is applied client-side instead.
+SCA_INVALID_PARAMS = frozenset({
+    "include_annot", "violates_policy", "finding_category", "mitigated_after",
+})
+
+# Dynamic Analysis configuration service: "The maximum is 100".
+DA_PAGE_SIZE = 100
+
+# FindingStatus.resolution: the Findings v2.1 spec types it as a plain string
+# with no enum (its example is UNRESOLVED); the platform reports approved
+# mitigations as MITIGATED and false positives as POTENTIAL_FALSE_POSITIVE.
+# Fixed Date is filled only for CLOSED findings whose resolution is blank or
+# UNRESOLVED (an allow-list), so a mitigation, a false positive or any
+# unknown future value is never reported as a code fix.
+FIXED_RESOLUTIONS = frozenset({"", "UNRESOLVED"})
 
 # Retry policy
 RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 DEFAULT_MAX_ATTEMPTS = 6
 DEFAULT_BASE_BACKOFF = 1.5
 MAX_BACKOFF = 90.0
+# A server-supplied Retry-After above this is not slept through: the request
+# fails as a FetchError instead of stalling every worker for hours.
+MAX_RETRY_AFTER = 300.0
+
+# Request errors that will not succeed on retry (bad TLS trust / --ca-cert,
+# malformed URL or header). Retrying them only burns the backoff budget.
+# SSLError subclasses ConnectionError, so it must be checked first.
+PERMANENT_REQUEST_ERRORS: tuple[type[BaseException], ...] = (
+    requests.exceptions.SSLError,
+    requests.exceptions.InvalidURL,
+    requests.exceptions.MissingSchema,
+    requests.exceptions.InvalidSchema,
+    requests.exceptions.InvalidHeader,
+)
 
 # Veracode documents a 250 request/minute guidance. Warn above this.
 SAFE_RPS = 4.0
@@ -145,6 +187,8 @@ CSV_FIELDNAMES: list[str] = [
     "Component ID",
     "Location Detail",
     "Business Unit",
+    # Appended last so every earlier column keeps its position.
+    "Last Seen Date",
 ]
 
 # Finding identity
@@ -317,6 +361,50 @@ class FailureTracker:
 # Session Factory
 # ---------------------------------------------------------------------------
 
+class ResolvedEnvSession(requests.Session):
+    """Session that reads proxy and CA-bundle settings once per host.
+
+    With ``trust_env`` on, requests re-reads HTTP(S)_PROXY / ALL_PROXY /
+    NO_PROXY, REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE and, on Windows, the
+    registry proxy settings on every request (3.9 s of 4.4 s spent in
+    Session.request in a 10k-finding profile). Here ``trust_env`` is off and
+    the same lookups run once per scheme+host, then are merged exactly as
+    requests merges them: per-host NO_PROXY bypass, and an env CA bundle
+    still overrides Session.verify (--ca-cert) unless a request passes its
+    own ``verify``. A side effect of trust_env=False: ~/.netrc credentials
+    are no longer added to unauthenticated (IaC token) requests.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.trust_env = False
+        self._env_by_origin: dict[tuple[str, str], tuple[dict[str, str], Optional[str]]] = {}
+
+    def _environment_for(self, url: str) -> tuple[dict[str, str], Optional[str]]:
+        parts = urlsplit(url)
+        key = (parts.scheme.lower(), parts.netloc.lower())
+        hit = self._env_by_origin.get(key)
+        if hit is None:
+            proxies = requests.utils.get_environ_proxies(url, no_proxy=None)
+            bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("CURL_CA_BUNDLE")
+            hit = self._env_by_origin[key] = (proxies, bundle)
+        return hit
+
+    def merge_environment_settings(self, url, proxies, stream, verify, cert):
+        proxies = {} if proxies is None else proxies
+        if proxies.get("no_proxy") is not None:
+            # A per-request no_proxy changes the bypass decision; not cached.
+            env_proxies = requests.utils.get_environ_proxies(url, no_proxy=proxies["no_proxy"])
+            bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("CURL_CA_BUNDLE")
+        else:
+            env_proxies, bundle = self._environment_for(url)
+        for k, v in env_proxies.items():
+            proxies.setdefault(k, v)
+        if verify is True or verify is None:
+            verify = bundle or verify
+        return super().merge_environment_settings(url, proxies, stream, verify, cert)
+
+
 def create_session(ca_cert: Optional[str] = None, use_hmac: bool = True) -> requests.Session:
     """Create an HTTP session with connection pooling and optional custom CA cert.
 
@@ -332,7 +420,7 @@ def create_session(ca_cert: Optional[str] = None, use_hmac: bool = True) -> requ
             "openssl x509 -inform DER -in corp-ca.cer -out corp-ca.pem"
         )
 
-    session = requests.Session()
+    session = ResolvedEnvSession()
     adapter = requests.adapters.HTTPAdapter(
         pool_connections=20,
         pool_maxsize=50,
@@ -394,7 +482,12 @@ class RateLimiter:
         self._lock = threading.Lock()
 
     def pause(self, seconds: float) -> None:
-        """Stall all callers for at least *seconds* (global backoff)."""
+        """Stall all callers for at least *seconds* (global backoff).
+
+        Capped at MAX_RETRY_AFTER so one hostile or buggy Retry-After cannot
+        freeze every worker for a day.
+        """
+        seconds = min(max(0.0, seconds), MAX_RETRY_AFTER)
         with self._lock:
             target = time.monotonic() + seconds
             if target > self._pause_until:
@@ -484,7 +577,11 @@ def request_with_retry(
         max_attempts = DEFAULT_MAX_ATTEMPTS
     max_attempts = max(1, max_attempts)
     # requests has no default timeout; a stalled socket would hang a worker.
-    kwargs.setdefault("timeout", DEFAULT_REQUEST_TIMEOUT)
+    # A bare number is the read timeout; the connect timeout is added.
+    timeout = kwargs.get("timeout", DEFAULT_REQUEST_TIMEOUT)
+    if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
+        timeout = (CONNECT_TIMEOUT, timeout)
+    kwargs["timeout"] = timeout
 
     for attempt in range(1, max_attempts + 1):
         if rate_limiter:
@@ -493,6 +590,10 @@ def request_with_retry(
         retry_after: Optional[float] = None
         try:
             resp = session.get(url, **kwargs)
+        except PERMANENT_REQUEST_ERRORS as exc:
+            raise FetchError(
+                f"{scope}: {type(exc).__name__} (not retried): {str(exc)[:200]}"
+            ) from exc
         except requests.RequestException as exc:
             last_detail = f"{type(exc).__name__}: {str(exc)[:200]}"
         else:
@@ -522,8 +623,13 @@ def request_with_retry(
             last_detail = f"HTTP {resp.status_code}"
             retry_after = _retry_after_seconds(resp)
             if resp.status_code == 429 and rate_limiter:
-                # Stall every worker, not just this one.
+                # Stall every worker, not just this one (pause() is capped).
                 rate_limiter.pause(retry_after if retry_after is not None else 30.0)
+            if retry_after is not None and retry_after > MAX_RETRY_AFTER:
+                raise FetchError(
+                    f"{scope}: HTTP {resp.status_code} with Retry-After "
+                    f"{retry_after:.0f}s, above the {MAX_RETRY_AFTER:.0f}s cap; "
+                    f"not waiting")
 
         if tracker:
             tracker.record_retry(was_rate_limit=last_detail == "HTTP 429")
@@ -567,6 +673,35 @@ def _has_next(data: dict) -> bool:
     return bool((data.get("_links") or {}).get("next"))
 
 
+def _record_identity(record: Any) -> Any:
+    """Identity used to spot a record served twice during one walk.
+
+    Findings carry ``issue_id`` (unique per scan type within one context);
+    anything else (applications, sandboxes, SCA findings without an
+    issue_id) is identified by a stable hash of the whole record.
+    """
+    if isinstance(record, dict) and not _blank(record.get("issue_id")):
+        return ("issue", _s(record.get("scan_type")), _s(record.get("issue_id")))
+    blob = json.dumps(record, sort_keys=True, default=str, ensure_ascii=False)
+    return ("hash", hashlib.sha256(blob.encode("utf-8")).hexdigest())
+
+
+def _json_object(resp: requests.Response, where: str) -> dict:
+    """Decode a JSON object body or raise FetchError.
+
+    A 200 carrying ``null``, a list or a scalar used to escape as an
+    AttributeError, bypassing the failure accounting and the FATAL path.
+    """
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise FetchError(f"{where}: invalid JSON response ({exc})") from exc
+    if not isinstance(data, dict):
+        raise FetchError(
+            f"{where}: expected a JSON object, got {type(data).__name__}")
+    return data
+
+
 def paginate(
     session: requests.Session,
     url: str,
@@ -581,6 +716,7 @@ def paginate(
     sleep_time: float = 0.0,
     max_pages: int = MAX_PAGES_SAFETY_CAP,
     on_page: Optional[Any] = None,
+    empty_on_404: bool = True,
 ) -> tuple[list[dict], Optional[int], int]:
     """Walk every page of a Veracode HAL collection.
 
@@ -593,17 +729,28 @@ def paginate(
       truncates the walk exactly like the bug this script exists to fix.
       Only when both signals agree there is no more data do we stop.
     - An empty page ends the walk only when no next link is advertised, so a
-      single sparse page cannot end it early.
+      single sparse page cannot end it early. Two consecutive empty pages
+      while ``_links.next`` or ``total_pages`` still says more exists is a
+      FetchError (the result would be silently truncated otherwise).
+    - A page whose records were all seen earlier in the walk (a repeated
+      page from a cache, proxy or unstable sort), or any record served
+      twice, is a FetchError: the count may still match ``total_elements``
+      while real records were never fetched.
     - ``max_pages`` is a hard backstop against an API that advertises a next
       link forever. Hitting it is recorded as a failure, never silently.
 
+    A 404 on page 0 means "no data" unless *empty_on_404* is False, in which
+    case it is a FetchError (used for the application list, where a 404 means
+    a wrong base URL or path rather than an empty tenant).
+
     Returns ``(records, total_elements_reported, pages_fetched)``.
-    Raises FetchError if any page could not be retrieved.
+    Raises FetchError if any page could not be retrieved or is inconsistent.
     """
     base_params = dict(params or {})
     base_params["size"] = page_size
 
     records: list[dict] = []
+    seen_ids: set = set()
     total_elements: Optional[int] = None
     total_pages: Optional[int] = None
     page = 0
@@ -629,12 +776,11 @@ def paginate(
                 raise FetchError(
                     f"{scope} page {page}: HTTP 404 mid-walk after "
                     f"{len(records)} records")
+            if not empty_on_404:
+                raise FetchError(f"{scope} page 0: HTTP 404 (endpoint not found)")
             break
 
-        try:
-            data = resp.json()
-        except ValueError as exc:
-            raise FetchError(f"{scope} page {page}: invalid JSON response ({exc})") from exc
+        data = _json_object(resp, f"{scope} page {page}")
 
         pages_fetched += 1
         if tracker:
@@ -647,6 +793,18 @@ def paginate(
             total_pages = tp
 
         if batch:
+            ids = [_record_identity(r) for r in batch]
+            repeats = sum(1 for i in ids if i in seen_ids)
+            if repeats == len(ids):
+                raise FetchError(
+                    f"{scope} page {page}: repeated page (all {len(ids)} records "
+                    f"were already returned by an earlier page)")
+            if repeats or len(set(ids)) != len(ids):
+                raise FetchError(
+                    f"{scope} page {page}: {repeats or len(ids) - len(set(ids))} "
+                    f"duplicate record(s) across pages; total_elements="
+                    f"{total_elements}, unique so far {len(seen_ids)}")
+            seen_ids.update(ids)
             records.extend(batch)
             empty_streak = 0
             if on_page:
@@ -667,8 +825,17 @@ def paginate(
             break
 
         # An API that advertises more but keeps returning nothing would spin
-        # forever. Two consecutive empty pages means it has nothing left.
+        # forever. Two consecutive empty pages end the walk; if a next link or
+        # total_pages still promised more, that is a truncation, not the end.
+        # (A short count alone is left to the caller's total_elements check,
+        # which reports it as a MISMATCH.)
         if empty_streak >= 2:
+            if next_link or meta_says_more:
+                raise FetchError(
+                    f"{scope} page {page}: {empty_streak} consecutive empty pages "
+                    f"while the API still advertises more data "
+                    f"(next link={next_link}, total_pages={total_pages}); "
+                    f"stopped after {len(records)} records")
             break
 
         page += 1
@@ -798,7 +965,9 @@ def _extract_mitigation_comments(finding: dict[str, Any]) -> Optional[str]:
     """
     annotations = finding.get("annotations") or []
     parts: list[str] = []
-    for ann in annotations:
+    for ann in annotations if isinstance(annotations, list) else []:
+        if not isinstance(ann, dict):
+            continue
         comment = ann.get("comment")
         if comment:
             action = ann.get("action", "")
@@ -1036,6 +1205,14 @@ def _link_static(
     base: str, app_guid: str, app_id: Optional[str], app_oid: Optional[str],
     sandbox_guid: Optional[str], finding_obj: Optional[dict], details: Optional[dict],
 ) -> str:
+    # The scan-url params and the app's build list describe POLICY scans
+    # only, so a sandbox finding would deep-link to the policy build. Sandbox
+    # findings get the application-level module list instead.
+    if sandbox_guid:
+        if app_oid and app_id:
+            return f"{base}#AnalyzeAppModuleList:{app_oid}:{app_id}:"
+        return f"{base}#AnalyzeAppModuleList:{_link_suffix(app_guid, sandbox_guid)}"
+
     scan_params = None
     if finding_obj:
         # Prefer the params for the build the finding actually came from.
@@ -1072,7 +1249,7 @@ def _link_sca(
     sandbox_guid: Optional[str], finding_obj: Optional[dict], details: Optional[dict],
 ) -> str:
     if details:
-        metadata = details.get("metadata") or {}
+        metadata = _sca_metadata(details)
         if str(metadata.get("sca_scan_mode", "")).upper() == "AGENT":
             ws = (
                 details.get("workspace_guid") or details.get("workspace_id")
@@ -1086,7 +1263,8 @@ def _link_sca(
                 return f"{SCA_UI_BASE}/workspaces/{ws}/projects/{pid}/issues"
             return f"{SCA_UI_BASE}/workspaces"
 
-    scan_params = (finding_obj or {}).get("_latest_scan_params")
+    # Policy-scan params only; a sandbox finding gets the app-level page.
+    scan_params = None if sandbox_guid else (finding_obj or {}).get("_latest_scan_params")
     if scan_params and app_oid and app_id:
         return f"{base}#ReviewResultsSCA:{app_oid}:{app_id}:{scan_params}"
     if app_oid and app_id:
@@ -1098,6 +1276,34 @@ def _link_sca(
 # Finding Normalisation
 # ---------------------------------------------------------------------------
 
+def _sca_metadata(details: Any) -> dict[str, Any]:
+    """finding_details.metadata as a dict.
+
+    The Findings spec declares ``metadata`` a string while its example shows
+    an object; anything that is not an object is treated as absent.
+    """
+    meta = details.get("metadata") if isinstance(details, dict) else None
+    return meta if isinstance(meta, dict) else {}
+
+
+def _sca_identity(details: dict[str, Any]) -> Optional[str]:
+    """Stable identity for an SCA finding, or None without a component_id.
+
+    component_id names the library version and the CVE (or, without one, the
+    CWE) names the vulnerability, so together they survive rescans.
+    component_path is not used: upload-scan paths embed a per-upload file
+    id (``file330108_1682024184933_html/...``) that changes on every scan.
+    """
+    comp = _s(details.get("component_id"))
+    if not comp:
+        return None
+    vuln = _s(_extract_cve_id(details))
+    if not vuln:
+        cwe = _s(_extract_cwe_id(details))
+        vuln = f"cwe:{cwe}" if cwe else ""
+    return f"sca:{comp}~{vuln}"
+
+
 def normalize_finding(finding: dict[str, Any]) -> dict[str, Any]:
     """Normalise a raw API finding record into the common CSV schema."""
     app_profile = finding.get("_app_profile") or {}
@@ -1107,7 +1313,7 @@ def normalize_finding(finding: dict[str, Any]) -> dict[str, Any]:
 
     # Refine scan-type label for display
     if scan_type == "SCA":
-        if (details.get("metadata") or {}).get("sca_scan_mode") == "AGENT":
+        if _sca_metadata(details).get("sca_scan_mode") == "AGENT":
             scan_type = "SCA Agent"
     elif scan_type == "DYNAMIC":
         if finding.get("_dynamic_analysis_id"):
@@ -1117,12 +1323,19 @@ def normalize_finding(finding: dict[str, Any]) -> dict[str, Any]:
 
     status_obj = finding.get("finding_status") or {}
     first_found = status_obj.get("first_found_date")
+    last_seen = status_obj.get("last_seen_date")
     status = status_obj.get("status")
     resolution_status = status_obj.get("resolution_status")
+    resolution = status_obj.get("resolution")
 
+    # The Findings API has no fix date (FindingStatus has no resolution_date).
+    # For a CLOSED finding that was fixed (not mitigated, not a false
+    # positive) the best available value is last_seen_date: the last scan in
+    # which the flaw was still present. A mitigated finding is never "fixed".
     fixed_date = None
-    if status == "CLOSED" or resolution_status == "FIXED":
-        fixed_date = status_obj.get("resolution_date") or status_obj.get("last_seen_date")
+    if (str(status or "").upper() == "CLOSED"
+            and _s(resolution).upper() in FIXED_RESOLUTIONS):
+        fixed_date = last_seen
 
     cve_id = _extract_cve_id(details)
     flaw_name = _extract_cwe_name(details)
@@ -1137,7 +1350,10 @@ def normalize_finding(finding: dict[str, Any]) -> dict[str, Any]:
     app_oid = finding.get("_app_oid")
 
     issue_id = finding.get("issue_id")
-    identity = issue_id if not _blank(issue_id) else _content_identity(details, original_scan_type)
+    identity = _sca_identity(details) if original_scan_type == "SCA" else None
+    if identity is None:
+        identity = (issue_id if not _blank(issue_id)
+                    else _content_identity(details, original_scan_type))
     finding_uid, finding_key = build_finding_identity(
         app_guid,
         finding.get("_sandbox_guid") or CONTEXT_POLICY,
@@ -1170,7 +1386,7 @@ def normalize_finding(finding: dict[str, Any]) -> dict[str, Any]:
         "CVSS": _extract_cvss(details),
         "Severity": severity,
         "Resolution Status": resolution_status,
-        "Resolution": status_obj.get("resolution"),
+        "Resolution": resolution,
         "Veracode Link": _generate_veracode_link(
             app_guid, original_scan_type, details,
             finding.get("_sandbox_guid"), finding, app_id, app_oid,
@@ -1178,6 +1394,9 @@ def normalize_finding(finding: dict[str, Any]) -> dict[str, Any]:
         "Mitigation Comments": _extract_mitigation_comments(finding),
         "Issue ID": finding.get("issue_id"),
         "Violates Policy": finding.get("violates_policy"),
+        "Last Seen Date": last_seen,
+        # Set when per-finding enrichment failed (row kept, links degraded).
+        "Export Notes": finding.get("_export_note"),
     }
 
 
@@ -1281,6 +1500,7 @@ def normalize_iac_finding(
         "IAC End Line": end_line or None,
         "Issue ID": finding_id or None,
         "Violates Policy": None,
+        "Last Seen Date": iac_record.get("scanned_at"),
     }
 
 
@@ -1316,6 +1536,10 @@ def get_applications(
         page_size=DEFAULT_PAGE_SIZE,
         timeout=60,
         on_page=_progress,
+        # A 404 here is a wrong VERACODE_API_BASE, proxy rewrite or path
+        # change, never an empty tenant; exporting zero apps as COMPLETE
+        # would be a silent total loss.
+        empty_on_404=False,
     )
 
     if expected is not None and expected != len(apps):
@@ -1361,17 +1585,33 @@ def get_sandboxes(
     return sandboxes
 
 
+def _map_in_order(fn: Any, items: list[Any], max_workers: int) -> list[Any]:
+    """``[fn(x) for x in items]``, run on a pool when max_workers > 1.
+
+    Results come back in input order whatever order the calls finish in, so
+    callers merge them exactly as the sequential loop did.
+    """
+    if max_workers <= 1 or len(items) <= 1:
+        return [fn(x) for x in items]
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(items))) as pool:
+        return list(pool.map(fn, items))
+
+
 def get_sca_workspaces(
     session: requests.Session,
     sleep_time: float,
     rate_limiter: Optional[RateLimiter],
     tracker: FailureTracker,
+    max_workers: int = 1,
+    ca_cert: Optional[str] = None,
 ) -> dict[str, dict[str, str]]:
     """Fetch SCA workspaces/projects.
 
     Returns a lookup keyed by lower-cased project name and 'guid:<app_guid>'.
     This map only drives deep-link construction; it never affects which
-    findings are retrieved.
+    findings are retrieved. With max_workers > 1 the per-workspace project
+    walks run on a pool (one session per thread, shared rate limiter) and
+    are merged in workspace order, so the map is the same as a serial run.
     """
     ws_map: dict[str, dict[str, str]] = {}
     try:
@@ -1391,16 +1631,11 @@ def get_sca_workspaces(
 
     print(f"  Fetched {len(all_ws)} SCA workspaces")
 
-    total_proj = 0
-    name_collisions = 0
-    for workspace in all_ws:
-        ws_id = workspace.get("id")
-        ws_site = workspace.get("site_id")
-        if not ws_id:
-            continue
+    def fetch_projects(ws_id: str) -> Any:
+        sess = session if max_workers <= 1 else _thread_session(ca_cert=ca_cert)
         try:
             projects, _, _ = paginate(
-                session, f"{SCA_API_BASE}/workspaces/{ws_id}/projects", "projects",
+                sess, f"{SCA_API_BASE}/workspaces/{ws_id}/projects", "projects",
                 scope=f"sca-projects[{ws_id}]",
                 rate_limiter=rate_limiter,
                 tracker=tracker,
@@ -1408,9 +1643,21 @@ def get_sca_workspaces(
                 timeout=60,
                 sleep_time=sleep_time,
             )
+            return projects
         except FetchError as exc:
-            tracker.record_failure(f"sca-projects[{ws_id}]", str(exc))
-            print(f"    FAILED to fetch SCA projects for workspace {ws_id}: {exc}")
+            return exc
+
+    with_id = [w for w in all_ws if w.get("id")]
+    results = _map_in_order(fetch_projects, [w.get("id") for w in with_id], max_workers)
+
+    total_proj = 0
+    name_collisions = 0
+    for workspace, projects in zip(with_id, results):
+        ws_id = workspace.get("id")
+        ws_site = workspace.get("site_id")
+        if isinstance(projects, FetchError):
+            tracker.record_failure(f"sca-projects[{ws_id}]", str(projects))
+            print(f"    FAILED to fetch SCA projects for workspace {ws_id}: {projects}")
             continue
 
         for proj in projects:
@@ -1439,10 +1686,14 @@ def get_dynamic_analyses(
     sleep_time: float,
     rate_limiter: Optional[RateLimiter],
     tracker: FailureTracker,
+    max_workers: int = 1,
+    ca_cert: Optional[str] = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Fetch Dynamic Analysis metadata keyed by linked application GUID.
 
     Both the analyses list and each analysis's scan list are now paginated.
+    With max_workers > 1 the per-analysis scan walks run on a pool and are
+    merged in analysis order, so each app's list order matches a serial run.
     """
     da_map: dict[str, list[dict]] = {}
     try:
@@ -1451,7 +1702,7 @@ def get_dynamic_analyses(
             scope="dynamic-analyses",
             rate_limiter=rate_limiter,
             tracker=tracker,
-            page_size=DEFAULT_PAGE_SIZE,
+            page_size=DA_PAGE_SIZE,
             timeout=60,
             sleep_time=sleep_time,
         )
@@ -1460,22 +1711,30 @@ def get_dynamic_analyses(
         print(f"    FAILED to fetch Dynamic Analyses: {exc}")
         return da_map
 
-    for analysis in analyses:
-        a_id = analysis.get("analysis_id")
-        if not a_id:
-            continue
+    def fetch_scans(a_id: str) -> Any:
+        sess = session if max_workers <= 1 else _thread_session(ca_cert=ca_cert)
         try:
             scans, _, _ = paginate(
-                session, f"{DYNAMIC_ANALYSES_URL}/{a_id}/scans", "scans",
+                sess, f"{DYNAMIC_ANALYSES_URL}/{a_id}/scans", "scans",
                 scope=f"dynamic-analysis-scans[{a_id}]",
                 rate_limiter=rate_limiter,
                 tracker=tracker,
-                page_size=DEFAULT_PAGE_SIZE,
+                page_size=DA_PAGE_SIZE,
                 timeout=60,
                 sleep_time=sleep_time,
             )
+            return scans
         except FetchError as exc:
-            tracker.record_failure(f"dynamic-analysis-scans[{a_id}]", str(exc))
+            return exc
+
+    with_id = [a for a in analyses if a.get("analysis_id")]
+    results = _map_in_order(fetch_scans, [a.get("analysis_id") for a in with_id],
+                            max_workers)
+
+    for analysis, scans in zip(with_id, results):
+        a_id = analysis.get("analysis_id")
+        if isinstance(scans, FetchError):
+            tracker.record_failure(f"dynamic-analysis-scans[{a_id}]", str(scans))
             continue
 
         for scan in scans:
@@ -1538,6 +1797,15 @@ def _fetch_findings_context(
     # API query parameter; sending it silently returns unfiltered data. The
     # filter is applied client-side by the caller instead.
 
+    # The spec marks these "Not valid for the SCA scan type". If the server
+    # ignored violates_policy, --violates-policy would return every SCA
+    # finding; if it rejected either, every SCA context would fail.
+    sca_policy_filter = False
+    if scan_type == "SCA":
+        sca_policy_filter = bool(filters.get("violates_policy"))
+        for key in SCA_INVALID_PARAMS:
+            params.pop(key, None)
+
     context_label = f"sandbox:{sandbox_name}" if sandbox_guid else "policy"
     scope = f"findings[{app_name}|{context_label}|{scan_type or 'ALL'}]"
 
@@ -1591,11 +1859,37 @@ def _fetch_findings_context(
         recon["Detail"] = f"API reported {expected}, retrieved {len(findings)}"
         print(f"    ! MISMATCH {scope}: expected {expected}, got {len(findings)}")
 
+    if sca_policy_filter:
+        # Reconciliation compares the unfiltered walk with total_elements;
+        # the policy filter is applied afterwards, like --status.
+        kept = [f for f in findings if f.get("violates_policy") is True]
+        note = (f"--violates-policy applied client-side: kept {len(kept)} "
+                f"of {len(findings)}")
+        recon["Detail"] = f"{recon['Detail']}; {note}" if recon["Detail"] else note
+        findings = kept
+
     if findings:
         print(f"    [{context_label}|{scan_type or 'ALL'}] {len(findings)} findings "
               f"across {pages} page(s)")
 
     return findings, recon
+
+
+def _skipped_recon(app_name: str, app_guid: str, scan_type: str) -> dict[str, Any]:
+    """Reconciliation row for a policy request that was not sent."""
+    return {
+        "Application Name": app_name,
+        "Application GUID": app_guid,
+        "Context": "policy",
+        "Scan Type Requested": scan_type,
+        "Expected (API total_elements)": "",
+        "Retrieved": 0,
+        "Pages Fetched": 0,
+        "Status": "SKIPPED",
+        "Detail": (f"no {scan_type} scan in the application's scans list "
+                   "(Applications API), so the request can only be empty; "
+                   "pass --request-all-scan-types to send it anyway"),
+    }
 
 
 def _get_all_findings_for_app(
@@ -1613,16 +1907,30 @@ def _get_all_findings_for_app(
     page_size: int,
     include_annotations: bool,
     combine_scan_types: bool,
+    app_scan_types: Optional[frozenset[str]] = None,
+    sink: Optional[Callable[[list[dict[str, Any]]], None]] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Fetch findings for the policy scan plus, optionally, every sandbox.
 
     SCA must be requested on its own: Veracode documents that combining SCA
     with other scan types is not supported.
+
+    *app_scan_types* is the set of scan types in the Applications API
+    ``scans`` list (None = unknown). In the policy context, DYNAMIC and
+    MANUAL are only requested when listed there; skipped requests get a
+    SKIPPED reconciliation row. Sandbox contexts always request every type.
+
+    With *sink*, each context's findings are handed to ``sink(list)`` as
+    soon as they are fetched and released before the next request (the
+    returned findings list is then empty).
     """
     all_findings: list[dict] = []
     recon_rows: list[dict] = []
 
-    requested = _parse_requested_scan_types(filters.get("scan_type"))
+    # dict.fromkeys de-duplicates while keeping order: "STATIC,STATIC" must
+    # not fetch (and export) the same context twice.
+    requested = list(dict.fromkeys(_parse_requested_scan_types(filters.get("scan_type"))))
+    non_sca: list[str]
     if requested:
         fetch_sca = "SCA" in requested
         non_sca = [t for t in requested if t in NON_SCA_SCAN_TYPES]
@@ -1633,10 +1941,19 @@ def _get_all_findings_for_app(
     # Only single scan_type values are documented. Requesting them one at a
     # time is a few extra calls per app but removes the risk that a
     # comma-joined value is partially honoured or ignored outright.
-    if combine_scan_types:
-        non_sca_batches = [",".join(non_sca)] if non_sca else []
-    else:
-        non_sca_batches = list(non_sca)
+    def batches(types: list[str]) -> list[str]:
+        if combine_scan_types:
+            return [",".join(types)] if types else []
+        return list(types)
+
+    # Policy context: a DYNAMIC or MANUAL request for an app whose scans list
+    # has no scan of that type can only return an empty page (39% of all
+    # calls on a benchmark tenant). STATIC and SCA are always requested.
+    policy_skipped: list[str] = []
+    if app_scan_types is not None:
+        policy_skipped = [t for t in non_sca
+                          if t in POLICY_SKIPPABLE_SCAN_TYPES and t not in app_scan_types]
+    policy_non_sca = [t for t in non_sca if t not in policy_skipped]
 
     contexts: list[tuple[Optional[str], Optional[str]]] = [(None, None)]
 
@@ -1650,23 +1967,32 @@ def _get_all_findings_for_app(
                 contexts.append((sg, sb.get("name", sg)))
 
     for ctx_guid, ctx_name in contexts:
-        for st in non_sca_batches:
+        # (scan_type value, skip?) in request order.
+        if ctx_guid is not None:
+            todo = [(b, False) for b in batches(non_sca)]
+        elif combine_scan_types:
+            todo = ([(t, True) for t in policy_skipped]
+                    + [(b, False) for b in batches(policy_non_sca)])
+        else:
+            todo = [(t, t in policy_skipped) for t in non_sca]
+        if fetch_sca:
+            todo.append(("SCA", False))
+
+        for st, skip in todo:
+            if skip:
+                recon_rows.append(_skipped_recon(app_name, app_guid, st))
+                continue
             findings, recon = _fetch_findings_context(
                 session, app_guid, app_name, app_profile, st, filters,
                 sleep_time, ctx_guid, ctx_name, app_id, app_oid,
                 rate_limiter, tracker, page_size, include_annotations,
             )
-            all_findings.extend(findings)
             recon_rows.append(recon)
-
-        if fetch_sca:
-            findings, recon = _fetch_findings_context(
-                session, app_guid, app_name, app_profile, "SCA", filters,
-                sleep_time, ctx_guid, ctx_name, app_id, app_oid,
-                rate_limiter, tracker, page_size, include_annotations,
-            )
-            all_findings.extend(findings)
-            recon_rows.append(recon)
+            if sink is not None:
+                sink(findings)
+            else:
+                all_findings.extend(findings)
+            del findings  # do not hold this context while fetching the next
 
     return all_findings, recon_rows
 
@@ -1674,6 +2000,51 @@ def _get_all_findings_for_app(
 # ---------------------------------------------------------------------------
 # Per-Application Worker (thread pool)
 # ---------------------------------------------------------------------------
+
+def _enrich_finding(
+    finding: dict[str, Any],
+    app_guid: Optional[str],
+    app_name: str,
+    latest_scan_params: Optional[str],
+    static_params_by_build: dict[int, str],
+    dast_url_by_build: dict[int, str],
+    da_map: dict[str, list[dict[str, Any]]],
+    sca_map: dict[str, dict[str, str]],
+) -> None:
+    """Attach link-building hints to one finding (may raise; caller guards)."""
+    finding["_latest_scan_params"] = latest_scan_params
+    ftype = finding.get("scan_type")
+    build_id = finding.get("build_id")
+
+    if ftype == "STATIC" and build_id and build_id in static_params_by_build:
+        finding["_finding_scan_params"] = static_params_by_build[build_id]
+
+    elif ftype == "DYNAMIC":
+        if build_id and build_id in dast_url_by_build:
+            finding["_dast_scan_url"] = dast_url_by_build[build_id]
+        da_list = da_map.get(app_guid) if app_guid else None
+        if da_list:
+            finding["_dynamic_analysis_id"] = da_list[0].get("analysis_id")
+
+    elif ftype == "SCA":
+        if _sca_metadata(finding.get("finding_details")).get("sca_scan_mode") == "AGENT":
+            mapping = sca_map.get(f"guid:{app_guid}") or sca_map.get(app_name.lower())
+            if mapping:
+                finding["_sca_workspace_guid"] = mapping["workspace_guid"]
+                finding["_sca_project_id"] = mapping["project_id"]
+
+
+def _listed_scan_types(app: dict[str, Any]) -> Optional[frozenset[str]]:
+    """Scan types in the Applications API ``scans`` list, or None if unknown.
+
+    None (request every type) when the list is missing or holds anything
+    that is not an object, so a malformed record never hides findings.
+    """
+    scans = app.get("scans")
+    if not isinstance(scans, list) or not all(isinstance(s, dict) for s in scans):
+        return None
+    return frozenset(str(s.get("scan_type") or "").upper() for s in scans)
+
 
 def _process_application(
     app: dict[str, Any],
@@ -1690,8 +2061,14 @@ def _process_application(
     include_annotations: bool,
     combine_scan_types: bool,
     ca_cert: Optional[str] = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Fetch and enrich findings for one application (thread worker)."""
+    request_all_scan_types: bool = False,
+    prepare: Optional[Callable[[], PreparedBatch]] = None,
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Fetch and enrich findings for one application (thread worker).
+
+    Returns the raw findings list, or, with *prepare* (a factory such as
+    StreamingExporter.new_batch), a PreparedBatch normalised per context.
+    """
     session = _thread_session(ca_cert=ca_cert)
     profile = app.get("profile") or {}
     app_guid = app.get("guid")
@@ -1700,6 +2077,7 @@ def _process_application(
     try:
         app_id = app.get("id")
         app_oid = app.get("oid") or app.get("alt_org_id")
+        app_scan_types = None if request_all_scan_types else _listed_scan_types(app)
 
         # ---- Single-pass scan-URL parsing ----
         static_params_by_build: dict[int, str] = {}
@@ -1707,6 +2085,8 @@ def _process_application(
         latest_scan_params: Optional[str] = None
 
         for scan in app.get("scans") or []:
+            if not isinstance(scan, dict):
+                continue
             scan_url = scan.get("scan_url", "")
             if not scan_url:
                 continue
@@ -1724,38 +2104,52 @@ def _process_application(
 
         print(f"  [{idx}/{total}] {app_name} ({app_guid})")
 
-        findings, recon_rows = _get_all_findings_for_app(
-            session, app_guid, app_name, profile, filters,
-            sleep_time, include_sandboxes, app_id, app_oid, rate_limiter,
-            tracker, page_size, include_annotations, combine_scan_types,
-        )
-
         # ---- Enrich findings ----
-        for finding in findings:
-            finding["_latest_scan_params"] = latest_scan_params
-            ftype = finding.get("scan_type")
-            build_id = finding.get("build_id")
+        # Each finding is enriched on its own: one malformed record (for
+        # example finding_details.metadata arriving as a string) used to
+        # raise out of this loop and discard every finding of the app.
+        def enrich(found: list[dict[str, Any]]) -> None:
+            for finding in found:
+                try:
+                    _enrich_finding(finding, app_guid, app_name, latest_scan_params,
+                                    static_params_by_build, dast_url_by_build,
+                                    da_map, sca_map)
+                except Exception as exc:
+                    detail = f"{type(exc).__name__}: {exc}"
+                    issue = finding.get("issue_id", "?") if isinstance(finding, dict) else "?"
+                    tracker.record_failure(f"enrich[{app_name}]", f"issue_id={issue}: {detail}")
+                    if isinstance(finding, dict):
+                        finding["_export_note"] = f"ENRICHMENT_FAILED: {detail}"[:400]
 
-            if ftype == "STATIC" and build_id and build_id in static_params_by_build:
-                finding["_finding_scan_params"] = static_params_by_build[build_id]
+        result: Any
+        if prepare is None:
+            findings, recon_rows = _get_all_findings_for_app(
+                session, app_guid, app_name, profile, filters,
+                sleep_time, include_sandboxes, app_id, app_oid, rate_limiter,
+                tracker, page_size, include_annotations, combine_scan_types,
+                app_scan_types=app_scan_types,
+            )
+            enrich(findings)
+            result = findings
+        else:
+            # Enrich and normalise each context here, in the worker, so its
+            # raw dicts are freed before the next context is fetched.
+            batch = prepare()
 
-            elif ftype == "DYNAMIC":
-                if build_id and build_id in dast_url_by_build:
-                    finding["_dast_scan_url"] = dast_url_by_build[build_id]
-                da_list = da_map.get(app_guid)
-                if da_list:
-                    finding["_dynamic_analysis_id"] = da_list[0].get("analysis_id")
+            def sink(found: list[dict[str, Any]]) -> None:
+                enrich(found)
+                batch.add(found)
 
-            elif ftype == "SCA":
-                meta = (finding.get("finding_details") or {}).get("metadata") or {}
-                if meta.get("sca_scan_mode") == "AGENT":
-                    mapping = sca_map.get(f"guid:{app_guid}") or sca_map.get(app_name.lower())
-                    if mapping:
-                        finding["_sca_workspace_guid"] = mapping["workspace_guid"]
-                        finding["_sca_project_id"] = mapping["project_id"]
+            _, recon_rows = _get_all_findings_for_app(
+                session, app_guid, app_name, profile, filters,
+                sleep_time, include_sandboxes, app_id, app_oid, rate_limiter,
+                tracker, page_size, include_annotations, combine_scan_types,
+                app_scan_types=app_scan_types, sink=sink,
+            )
+            result = batch
 
-        print(f"    Total for {app_name}: {len(findings)}\n")
-        return findings, recon_rows
+        print(f"    Total for {app_name}: {len(result)}\n")
+        return result, recon_rows
 
     except Exception as exc:
         # Anything reaching here is unexpected; record it so the run cannot
@@ -1860,15 +2254,27 @@ def _paginate_iac(
     rate_limiter: Optional[RateLimiter],
     tracker: FailureTracker,
     extra_params: Optional[dict[str, Any]] = None,
+    stats: Optional[dict[str, Any]] = None,
 ) -> list[dict[str, Any]]:
     """Paginate an IaC/Container Security collection with retries.
 
-    This API uses ``pagination.total_pages`` and a ``limit`` parameter rather
-    than the HAL shape used elsewhere.
+    This API uses ``pagination.total_pages`` / ``total_elements`` and a
+    ``limit`` parameter rather than the HAL shape used elsewhere.
+
+    - Empty pages while ``total_pages`` says more remain are a FetchError.
+    - Without a ``pagination`` block a full page (``== limit``) means more
+      may follow, so the walk continues until a short or empty page.
+    - A page identical to the previous one is a FetchError.
+
+    When *stats* is given it is filled with ``pages`` (fetched) and
+    ``expected`` (``pagination.total_elements`` or None) for reconciliation.
     """
     all_records: list[dict] = []
     page = 0
     empty_streak = 0
+    prev_batch: Optional[list] = None
+    expected: Optional[int] = None
+    pages = 0
 
     while True:
         params = dict(extra_params or {})
@@ -1895,17 +2301,36 @@ def _paginate_iac(
                     f"{len(all_records)} records")
             break
 
-        try:
-            data = resp.json()
-        except ValueError as exc:
-            raise FetchError(f"{scope} page {page}: invalid JSON ({exc})") from exc
+        data = _json_object(resp, f"{scope} page {page}")
+        pages += 1
 
         records = data.get(records_key, []) or []
+        if not isinstance(records, list):
+            raise FetchError(f"{scope} page {page}: '{records_key}' is not a list")
+        if page > 0 and records and records == prev_batch:
+            raise FetchError(
+                f"{scope} page {page}: repeated page (identical to page {page - 1})")
+        prev_batch = records
         all_records.extend(records)
         empty_streak = 0 if records else empty_streak + 1
 
-        total_pages = (data.get("pagination") or {}).get("total_pages", 1) or 1
-        if page >= total_pages - 1 or empty_streak >= 2:
+        pagination = data.get("pagination")
+        pagination = pagination if isinstance(pagination, dict) else {}
+        te = pagination.get("total_elements")
+        if isinstance(te, (int, float)) and not isinstance(te, bool):
+            expected = int(te)
+        tp = pagination.get("total_pages")
+        if isinstance(tp, (int, float)) and not isinstance(tp, bool):
+            total_pages = int(tp)
+            if page >= total_pages - 1:
+                break
+            if not records:
+                # total_pages promises more but the API returned nothing.
+                raise FetchError(
+                    f"{scope} page {page}: empty page while total_pages="
+                    f"{total_pages}; stopped after {len(all_records)} records")
+        elif len(records) < IAC_MAX_RECORDS or empty_streak:
+            # No pagination block: only a full page can have a successor.
             break
 
         page += 1
@@ -1916,6 +2341,9 @@ def _paginate_iac(
             print(f"    ! {detail}")
             break
 
+    if stats is not None:
+        stats["pages"] = pages
+        stats["expected"] = expected
     return all_records
 
 
@@ -1952,6 +2380,61 @@ def _fetch_iac_scans(
     return all_records
 
 
+def _iac_recon_row(
+    asset_name: str, scan_id: Any, expected: Optional[int], retrieved: int,
+    pages: int, status: str = "OK", detail: str = "",
+) -> dict[str, Any]:
+    """Reconciliation row for one IaC scan's findings walk."""
+    return {
+        "Application Name": asset_name,
+        "Application GUID": "",
+        "Context": f"iac-scan:{scan_id}",
+        "Scan Type Requested": "IAC",
+        "Expected (API total_elements)": "" if expected is None else expected,
+        "Retrieved": retrieved,
+        "Pages Fetched": pages,
+        "Status": status,
+        "Detail": detail[:300],
+    }
+
+
+def _parse_when(value: Any) -> Optional[dt.datetime]:
+    """Parse ISO 8601 or epoch (s / ms) into an aware UTC datetime."""
+    if value in (None, ""):
+        return None
+    try:
+        if isinstance(value, (int, float)) or str(value).isdigit():
+            n = float(value)
+            return dt.datetime.fromtimestamp(n / 1000 if n > 1e11 else n, dt.timezone.utc)
+        s = str(value).strip().replace("Z", "+00:00")
+        s = re.sub(r"(\.\d{6})\d+", r"\1", s)  # trim nanoseconds
+        d = dt.datetime.fromisoformat(s)
+        return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def latest_iac_scans(scans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only the newest scan per (asset, asset type, scan type).
+
+    The scan list is the full scan history. Exporting every record repeated
+    each finding once per historical scan, all as OPEN, including findings
+    a later scan had already fixed. The asset is identified by asset_id when
+    present (survives renames), else by its name, case-insensitively.
+    Mirrors ``latest_scan_ids`` in Veracode-IaC-Extract.
+    """
+    floor = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    best: dict[tuple, tuple[dt.datetime, int]] = {}
+    for idx, s in enumerate(scans):
+        key = (_s(s.get("asset_id") or s.get("asset_name")).lower(),
+               _s(s.get("asset_type")).lower(), _s(s.get("scan_type")).lower())
+        when = _parse_when(s.get("scanned_at")) or floor
+        if key not in best or when > best[key][0]:
+            best[key] = (when, idx)
+    keep = {idx for _, idx in best.values()}
+    return [s for i, s in enumerate(scans) if i in keep]
+
+
 def _process_iac_scan(
     record: dict[str, Any],
     idx: int,
@@ -1961,30 +2444,51 @@ def _process_iac_scan(
     tracker: FailureTracker,
     ca_cert: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Fetch detailed findings for one IaC scan (thread worker)."""
+    """Fetch detailed findings for one IaC scan (thread worker).
+
+    The returned record carries a ``_recon`` reconciliation row.
+    """
     asset_name = record.get("asset_name", "Unknown")
     scan_id = record.get("scan_id")
 
     if not scan_id:
         tracker.record_failure(f"iac-scan[{asset_name}]", "record has no scan_id")
-        return record
+        out = record.copy()
+        out["_recon"] = _iac_recon_row(asset_name, "", None, 0, 0, "FAILED",
+                                       "record has no scan_id")
+        return out
 
+    scope = f"iac-findings[{asset_name}:{scan_id}]"
     session = _thread_session(ca_cert=ca_cert, use_hmac=False)
+    stats: dict[str, Any] = {}
     try:
         findings = _paginate_iac(
             session, IAC_FINDINGS_URL_TEMPLATE.format(scan_id=scan_id), tokens, "findings",
-            scope=f"iac-findings[{asset_name}:{scan_id}]",
+            scope=scope,
             rate_limiter=rate_limiter,
             tracker=tracker,
             extra_params={"sort": "severity", "direction": "desc"},
+            stats=stats,
         )
     except FetchError as exc:
-        tracker.record_failure(f"iac-findings[{asset_name}:{scan_id}]", str(exc))
+        tracker.record_failure(scope, str(exc))
+        tracker.record_page(ok=False)
         print(f"    FAILED IaC findings for {asset_name} (scan {scan_id}): {exc}")
         findings = []
+        recon = _iac_recon_row(asset_name, scan_id, None, 0, 0, "FAILED", str(exc))
+    else:
+        expected = stats.get("expected")
+        recon = _iac_recon_row(asset_name, scan_id, expected, len(findings),
+                               stats.get("pages", 0))
+        if expected is not None and expected != len(findings):
+            tracker.record_mismatch(scope, expected, len(findings))
+            recon["Status"] = "MISMATCH"
+            recon["Detail"] = f"API reported {expected}, retrieved {len(findings)}"
+            print(f"    ! MISMATCH {scope}: expected {expected}, got {len(findings)}")
 
     detailed_record = record.copy()
     detailed_record["detailed_findings"] = findings
+    detailed_record["_recon"] = recon
     print(f"    [{idx}/{total}] {asset_name} (scan {scan_id}): {len(findings)} findings")
     return detailed_record
 
@@ -1995,8 +2499,15 @@ def _fetch_iac_data_live(
     max_workers: int = 5,
     filter_apps: Optional[set[str]] = None,
     ca_cert: Optional[str] = None,
+    all_scans: bool = False,
 ) -> list[dict[str, Any]]:
-    """Fetch IaC scan data live via principal token auth."""
+    """Fetch IaC scan data live via principal token auth.
+
+    By default only the latest scan per asset is fetched (see
+    latest_iac_scans); *all_scans* keeps the full history. Records are
+    returned sorted by asset name and scan id so output order does not
+    depend on thread completion.
+    """
     print("  Obtaining principal token via HMAC auth...")
     tokens = IacTokenProvider(ca_cert=ca_cert)
     try:
@@ -2015,6 +2526,13 @@ def _fetch_iac_data_live(
 
     if not records:
         return []
+
+    if not all_scans:
+        latest = latest_iac_scans(records)
+        if len(latest) != len(records):
+            print(f"  Keeping the latest scan per asset: {len(records)} -> {len(latest)} "
+                  f"scans (pass --iac-all-scans to export the history)")
+        records = latest
 
     print(f"  Fetching detailed findings for {len(records)} scans...\n")
     detailed_records: list[dict] = []
@@ -2037,6 +2555,16 @@ def _fetch_iac_data_live(
                 name = rec.get("asset_name", "Unknown")
                 tracker.record_failure(f"iac-scan[{name}]", f"{type(exc).__name__}: {exc}")
                 print(f"    ERROR processing {name}: {exc}")
+                detailed_records.append({
+                    **rec, "detailed_findings": [],
+                    "_recon": _iac_recon_row(name, rec.get("scan_id", ""), None, 0, 0,
+                                             "FAILED", f"{type(exc).__name__}: {exc}"),
+                })
+
+    # as_completed yields in thread-completion order; sort so the IaC block
+    # of the CSV is reproducible run to run.
+    detailed_records.sort(key=lambda r: (_s(r.get("asset_name")).lower(),
+                                         _s(r.get("asset_name")), _s(r.get("scan_id"))))
 
     total_findings = sum(len(r.get("detailed_findings", [])) for r in detailed_records)
     print(f"\n  Fetched {len(detailed_records)} IaC scans with {total_findings} total findings")
@@ -2122,6 +2650,44 @@ def safe_normalize(
         return salvage
 
 
+# Characters that make Excel / LibreOffice / Sheets treat a cell as a formula
+# (OWASP CSV injection). Tab and CR are included because some importers
+# strip them and then evaluate what follows.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", chr(13))
+
+# os.replace on Windows fails with PermissionError while the destination is
+# open in Excel (no FILE_SHARE_DELETE). Retry a few times, then give up.
+PUBLISH_ATTEMPTS = 5
+PUBLISH_RETRY_DELAY = 2.0
+
+
+class PublishError(Exception):
+    """Raised when finished temp files could not be moved into place."""
+
+
+def _csv_safe(value: Any) -> Any:
+    """Neutralise spreadsheet formula injection in one CSV cell.
+
+    Descriptions, file names, procedures, comments and app names come from
+    scanned code or tenant users, so a cell such as ``=HYPERLINK(...)`` would
+    run when the CSV is opened in a spreadsheet. A string starting with
+    = + - @ tab or CR is prefixed with a single quote. Non-strings (numbers,
+    booleans, None) and strings that are plain numbers ("-1.5") are left
+    unchanged. Disabled with --raw-cells.
+    """
+    if not isinstance(value, str) or not value.startswith(_FORMULA_PREFIXES):
+        return value
+    try:
+        float(value)
+        return value
+    except ValueError:
+        return "'" + value
+
+
+def _csv_safe_row(row: dict[str, Any], fields: list[str]) -> dict[str, Any]:
+    return {k: _csv_safe(row.get(k)) for k in fields}
+
+
 def _sort_key(row: dict[str, Any]) -> tuple:
     """Deterministic ordering key.
 
@@ -2135,6 +2701,70 @@ def _sort_key(row: dict[str, Any]) -> tuple:
     return (s(row.get("Application Name")), s(row.get("Sandbox Name")),
             s(row.get("Scan Type")), s(row.get("Issue ID")),
             s(row.get("Finding UID")))
+
+
+class PreparedBatch:
+    """One application's findings, normalised as they arrive.
+
+    Created by StreamingExporter.new_batch() and filled with add() once per
+    request context in the worker thread, so a context's raw API dicts can
+    be freed before the next context is fetched: peak memory is the
+    normalised rows of one app plus the raw dicts of one context, instead of
+    the raw dicts AND the rows of the whole app. add() runs the steps
+    write_batch used to run on the main thread, in the same order (raw JSON
+    line, duplicate check, normalise, --status filter); write_batch() does
+    the rest (UID collisions, sort, write).
+    """
+
+    def __init__(self, tracker: FailureTracker, status_filter: Optional[str],
+                 dedup: bool, raw_json: bool) -> None:
+        self._tracker = tracker
+        self._status_filter = status_filter
+        self._dedup = dedup
+        self._raw_json = raw_json
+        self._seen: set = set()
+        self.rows: list[dict[str, Any]] = []
+        self.raw_lines: list[str] = []
+        self.retrieved = 0
+        self.filtered_out = 0
+        self.duplicates = 0
+        self.duplicates_removed = 0
+        self.retained_dups = 0
+        self.duplicate_samples: list[tuple] = []
+        self.app_name: Optional[str] = None
+
+    def __len__(self) -> int:
+        """Findings retrieved (before dedup and --status filtering)."""
+        return self.retrieved
+
+    def add(self, raw_findings: list[dict[str, Any]]) -> None:
+        for finding in raw_findings:
+            self.retrieved += 1
+            if self._raw_json:
+                self.raw_lines.append(json.dumps(finding, default=str) + "\n")
+            is_dict = isinstance(finding, dict)
+            if self.app_name is None and is_dict and finding.get("_app_name"):
+                self.app_name = finding.get("_app_name")
+            # Only findings with a real issue_id can be compared: SCA
+            # findings may carry issue_id=null, and keying those on None
+            # made every one of them a "duplicate" of the first.
+            if is_dict and not _blank(finding.get("issue_id")):
+                key = _finding_key(finding)
+                if key in self._seen:
+                    self.duplicates += 1
+                    if len(self.duplicate_samples) < 20:
+                        self.duplicate_samples.append(key)
+                    if self._dedup:
+                        self.duplicates_removed += 1
+                        continue
+                    self.retained_dups += 1
+                self._seen.add(key)
+
+            row = safe_normalize(finding, self._tracker)
+            if not _row_passes_status(row, self._status_filter):
+                self.filtered_out += 1
+                continue
+            self.rows.append(row)
 
 
 class StreamingExporter:
@@ -2168,21 +2798,25 @@ class StreamingExporter:
         raw_json_path: Optional[str] = None,
         dedup: bool = False,
         excel_bom: bool = False,
+        raw_cells: bool = False,
     ) -> None:
         self.csv_path = csv_path
         self.recon_path = recon_path
         self.tracker = tracker
         self.status_filter = status_filter
         self.dedup = dedup
+        self.raw_cells = raw_cells
         # Plain utf-8 by default. utf-8-sig makes Excel happy but prefixes a
         # BOM to the first header cell, which silently breaks csv.DictReader
         # and any downstream keying on "Application Name".
         self._encoding = "utf-8-sig" if excel_bom else "utf-8"
 
-        suffix = f".tmp.{os.getpid()}"
-        self._csv_tmp = csv_path + suffix
-        self._recon_tmp = recon_path + suffix
-        self._raw_tmp = (raw_json_path + suffix) if raw_json_path else None
+        # Temp paths are created in __enter__ (tempfile.mkstemp: O_EXCL,
+        # mode 0600, unpredictable name, same directory as the destination
+        # so os.replace stays atomic).
+        self._csv_tmp: Optional[str] = None
+        self._recon_tmp: Optional[str] = None
+        self._raw_tmp: Optional[str] = None
         self.raw_json_path = raw_json_path
 
         self.rows_written = 0
@@ -2203,64 +2837,93 @@ class StreamingExporter:
         self._lock = threading.Lock()
         self._closed = False
 
+    @staticmethod
+    def _open_temp(final_path: str, encoding: str, newline: Optional[str]) -> tuple[str, Any]:
+        """Create an exclusive 0600 temp file next to *final_path*."""
+        directory = os.path.dirname(os.path.abspath(final_path))
+        fd, tmp = tempfile.mkstemp(
+            prefix=os.path.basename(final_path) + ".", suffix=".tmp", dir=directory)
+        try:
+            fh = os.fdopen(fd, "w", encoding=encoding, newline=newline)
+        except Exception:
+            os.close(fd)
+            raise
+        return tmp, fh
+
     def __enter__(self) -> "StreamingExporter":
-        self._csv_fh = open(self._csv_tmp, "w", encoding=self._encoding, newline="")
+        self._csv_tmp, self._csv_fh = self._open_temp(self.csv_path, self._encoding, "")
         self._csv_writer = csv.DictWriter(
             self._csv_fh, fieldnames=CSV_FIELDNAMES, extrasaction="ignore")
         self._csv_writer.writeheader()
 
-        self._recon_fh = open(self._recon_tmp, "w", encoding=self._encoding, newline="")
+        self._recon_tmp, self._recon_fh = self._open_temp(
+            self.recon_path, self._encoding, "")
         self._recon_writer = csv.DictWriter(
             self._recon_fh, fieldnames=RECON_FIELDNAMES, extrasaction="ignore")
         self._recon_writer.writeheader()
 
-        self._raw_fh = (open(self._raw_tmp, "w", encoding="utf-8")
-                        if self._raw_tmp else None)
+        self._raw_fh = None
+        if self.raw_json_path:
+            self._raw_tmp, self._raw_fh = self._open_temp(self.raw_json_path, "utf-8", None)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close(publish=exc_type is None)
 
-    def write_batch(self, raw_findings: list[dict[str, Any]]) -> None:
-        """Normalise, filter, sort and write one application's findings.
+    def new_batch(self) -> "PreparedBatch":
+        """Empty batch carrying this exporter's filter / dedup settings.
+
+        Safe to call and fill from worker threads.
+        """
+        return PreparedBatch(self.tracker, self.status_filter, self.dedup,
+                             bool(self.raw_json_path))
+
+    def write_batch(self, raw_findings: "list[dict[str, Any]] | PreparedBatch") -> None:
+        """Write one application's findings: raw dicts or a PreparedBatch.
 
         Duplicate detection is exact despite streaming: a duplicate can only
         arise within one (app, sandbox, scan_type), and all of an
         application's contexts are fetched by a single worker, so the whole
         equivalence class is present in this batch.
         """
-        if not raw_findings:
+        if isinstance(raw_findings, PreparedBatch):
+            batch = raw_findings
+        else:
+            if not raw_findings:
+                return
+            batch = self.new_batch()
+            batch.add(raw_findings)
+        if not batch.retrieved:
             return
 
         with self._lock:
             if self._raw_fh:
                 # JSON Lines, not one giant indented array: constant memory
                 # and the file stays readable if the run is interrupted.
-                for f in raw_findings:
-                    self._raw_fh.write(json.dumps(f, default=str) + "\n")
+                self._raw_fh.writelines(batch.raw_lines)
 
-            seen: set = set()
-            batch: list[dict] = []
-            for finding in raw_findings:
-                if isinstance(finding, dict) and "issue_id" in finding:
-                    key = _finding_key(finding)
-                    if key in seen:
-                        self.duplicates_seen += 1
-                        if len(self._duplicate_samples) < 20:
-                            self._duplicate_samples.append(key)
-                        if self.dedup:
-                            self.duplicates_removed += 1
-                            continue
-                    seen.add(key)
+            self.duplicates_seen += batch.duplicates
+            room = 20 - len(self._duplicate_samples)
+            if room > 0:
+                self._duplicate_samples.extend(batch.duplicate_samples[:room])
+            self.duplicates_removed += batch.duplicates_removed
+            self.rows_filtered_out += batch.filtered_out
 
-                row = safe_normalize(finding, self.tracker)
-                if not _row_passes_status(row, self.status_filter):
-                    self.rows_filtered_out += 1
-                    continue
-                batch.append(row)
+            if batch.retained_dups:
+                # The key includes app, context and scan type, so a duplicate
+                # is the same finding written twice: the CSV is not a clean
+                # one-row-per-finding extract. With --dedup the extra rows
+                # are removed and the output is clean; a repeated API page
+                # (the usual cause) has already failed its context in
+                # paginate(), so that is not counted a second time here.
+                self.tracker.record_failure(
+                    f"duplicates[{batch.app_name or '?'}]",
+                    f"{batch.retained_dups} duplicate finding row(s) written; "
+                    f"re-run, or pass --dedup to drop them")
 
+            rows = batch.rows
             batch_uids: set[str] = set()
-            for row in batch:
+            for row in rows:
                 uid = row.get("Finding UID")
                 if not uid:
                     continue
@@ -2273,22 +2936,41 @@ class StreamingExporter:
                 else:
                     pool.add(uid)
 
-            batch.sort(key=_sort_key)
-            for row in batch:
-                self._csv_writer.writerow(row)
+            rows.sort(key=_sort_key)
+            for row in rows:
+                self._csv_writer.writerow(
+                    row if self.raw_cells else _csv_safe_row(row, CSV_FIELDNAMES))
                 self.by_scan_type[str(row.get("Scan Type"))] += 1
-            self.rows_written += len(batch)
+            self.rows_written += len(rows)
 
     def write_recon(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
             return
         with self._lock:
             for row in rows:
-                self._recon_writer.writerow(row)
+                self._recon_writer.writerow(
+                    row if self.raw_cells else _csv_safe_row(row, RECON_FIELDNAMES))
             self.recon_written += len(rows)
 
+    def _publish_one(self, tmp: str, final: str) -> None:
+        """os.replace with a few retries for Windows sharing violations."""
+        for attempt in range(1, PUBLISH_ATTEMPTS + 1):
+            try:
+                os.replace(tmp, final)  # atomic on POSIX and Windows
+                return
+            except PermissionError:
+                if attempt == PUBLISH_ATTEMPTS:
+                    raise
+                print(f"  {final} is locked (open in Excel?); retrying "
+                      f"{attempt}/{PUBLISH_ATTEMPTS - 1} in {PUBLISH_RETRY_DELAY:.0f}s")
+                time.sleep(PUBLISH_RETRY_DELAY)
+
     def close(self, publish: bool = True) -> None:
-        """Flush, fsync and atomically move temp files into place."""
+        """Flush, fsync and atomically move temp files into place.
+
+        Raises PublishError (listing the finished temp files) when a
+        destination stays locked after PUBLISH_ATTEMPTS tries.
+        """
         if self._closed:
             return
         self._closed = True
@@ -2308,11 +2990,17 @@ class StreamingExporter:
                   f"  The previous {self.csv_path} was NOT overwritten.")
             return
 
+        stuck: list[str] = []
         for tmp, final in ((self._csv_tmp, self.csv_path),
                            (self._recon_tmp, self.recon_path),
                            (self._raw_tmp, self.raw_json_path)):
             if tmp and final:
-                os.replace(tmp, final)  # atomic on POSIX and Windows
+                try:
+                    self._publish_one(tmp, final)
+                except PermissionError as exc:
+                    stuck.append(f"{final}: finished data is in {tmp} ({exc.strerror or exc})")
+        if stuck:
+            raise PublishError("; ".join(stuck))
 
     @property
     def duplicate_samples(self) -> list[tuple]:
@@ -2366,22 +3054,39 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="Request STATIC,DYNAMIC,MANUAL in one call instead of "
                         "separately. Fewer calls, but only single scan_type values "
                         "are documented.")
+    p.add_argument("--request-all-scan-types", action="store_true", default=False,
+                   help="Request DYNAMIC and MANUAL findings for the policy scan of "
+                        "every app. By default they are requested only when the "
+                        "app's scans list (Applications API) has a scan of that "
+                        "type; skipped requests are listed as SKIPPED in the "
+                        "reconciliation CSV.")
     p.add_argument("--excel-bom", action="store_true", default=False,
                    help="Write a UTF-8 BOM so Excel opens non-ASCII correctly. "
                         "Off by default because the BOM breaks csv.DictReader.")
     p.add_argument("--raw-json", action="store_true", default=False,
-                   help="Also write raw API findings as JSON Lines. Off by "
-                        "default: on a large tenant this file is enormous.")
+                   help="Also write raw API findings as JSON Lines next to "
+                        "--output. Off by default: on a large tenant this file "
+                        "is enormous.")
+    p.add_argument("--raw-cells", action="store_true", default=False,
+                   help="Write CSV cells verbatim. By default a text cell starting "
+                        "with = + - @ tab or CR is prefixed with ' so spreadsheets "
+                        "do not run it as a formula; use this for machine "
+                        "consumers / vulnerability-management imports.")
     p.add_argument("--dedup", action="store_true", default=False,
                    help="Drop duplicate finding identities. Duplicates are always "
                         "reported regardless of this flag.")
+    p.add_argument("--iac-all-scans", action="store_true", default=False,
+                   help="Export IaC findings from every historical scan of each "
+                        "asset (default: only the latest scan per asset).")
     p.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE,
                    help=f"Findings page size, 1-{MAX_PAGE_SIZE} (default: {DEFAULT_PAGE_SIZE}).")
     p.add_argument("--sleep", type=float, default=0.0,
                    help="Extra sleep between API pages (default: 0.0; the rate "
                         "limiter already paces requests).")
-    p.add_argument("--max-workers", type=int, default=5,
-                   help="Concurrent threads (default: 5).")
+    p.add_argument("--max-workers", type=int, default=8,
+                   help="Concurrent threads (default: 8). The shared --rate-limit "
+                        "still caps the request rate; more workers only keep it "
+                        "saturated when each page is slow.")
     p.add_argument("--rate-limit", type=float, default=3.5,
                    help="Max API requests/second (default: 3.5 = 210/min, under "
                         "Veracode's 250/min guidance).")
@@ -2403,6 +3108,11 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         p.error("--max-workers must be at least 1")
     if args.rate_limit <= 0:
         p.error("--rate-limit must be greater than 0")
+    # 0 used to mean "all apps" (falsy) and -1 silently dropped the last app.
+    if args.max_apps is not None and args.max_apps < 1:
+        p.error("--max-apps must be at least 1")
+    if args.max_attempts < 1:
+        p.error("--max-attempts must be at least 1")
     return args
 
 
@@ -2417,7 +3127,7 @@ def main() -> int:
     configure_api_base(resolve_api_base())
 
     global DEFAULT_MAX_ATTEMPTS  # noqa: PLW0603
-    DEFAULT_MAX_ATTEMPTS = max(1, args.max_attempts)
+    DEFAULT_MAX_ATTEMPTS = args.max_attempts  # validated >= 1 by _parse_args
 
     rate_limiter = RateLimiter(requests_per_second=args.rate_limit)
     tracker = FailureTracker()
@@ -2499,14 +3209,18 @@ def main() -> int:
             print("=" * 70)
             print("  FETCHING SCA WORKSPACE MAPPINGS")
             print("=" * 70)
-            sca_map = get_sca_workspaces(session, args.sleep, rate_limiter, tracker)
+            sca_map = get_sca_workspaces(session, args.sleep, rate_limiter, tracker,
+                                         max_workers=args.max_workers,
+                                         ca_cert=args.ca_cert)
             print("=" * 70 + "\n")
 
         if fetch_api_findings and fetch_da_links:
             print("=" * 70)
             print("  FETCHING DYNAMIC ANALYSIS MAPPINGS")
             print("=" * 70)
-            da_map = get_dynamic_analyses(session, args.sleep, rate_limiter, tracker)
+            da_map = get_dynamic_analyses(session, args.sleep, rate_limiter, tracker,
+                                          max_workers=args.max_workers,
+                                          ca_cert=args.ca_cert)
             if da_map:
                 total_da = sum(len(v) for v in da_map.values())
                 print(f"  Found {total_da} Dynamic Analyses across {len(da_map)} applications")
@@ -2529,10 +3243,10 @@ def main() -> int:
                 if resp.status_code == 404:
                     print(f"FATAL: application {args.app_guid} not found.\n")
                     return 1
-                applications = [resp.json()]
+                applications = [_json_object(resp, f"application[{args.app_guid}]")]
                 nm = (applications[0].get("profile") or {}).get("name", "Unknown")
                 print(f"  Resolved: {nm}\n")
-            except (FetchError, ValueError) as exc:
+            except FetchError as exc:
                 tracker.record_failure(f"application[{args.app_guid}]", str(exc))
                 print(f"FATAL: could not resolve application {args.app_guid}: {exc}\n")
                 return 1
@@ -2559,7 +3273,7 @@ def main() -> int:
                     tracker.record_failure(
                         "app-name-filter", f"not found: {', '.join(sorted(missing))}"
                     )
-            if args.max_apps:
+            if args.max_apps is not None:
                 applications = applications[:args.max_apps]
                 print(f"Limited to {args.max_apps} applications (for testing)\n")
     finally:
@@ -2580,9 +3294,10 @@ def main() -> int:
 
     # --- Phase 3: Fetch findings concurrently, streaming to disk ---
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    recon_path = os.path.splitext(args.output)[0] + f"_reconciliation_{timestamp}.csv"
-    raw_path = (f"veracode_findings_api_raw_{timestamp}.jsonl"
-                if args.raw_json else None)
+    out_stem = os.path.splitext(args.output)[0]
+    recon_path = out_stem + f"_reconciliation_{timestamp}.csv"
+    # Next to --output (same stem as the reconciliation file), not the CWD.
+    raw_path = (out_stem + f"_raw_{timestamp}.jsonl") if args.raw_json else None
 
     apps_with_findings = 0
     apps_ok = 0
@@ -2597,6 +3312,7 @@ def main() -> int:
         raw_json_path=raw_path,
         dedup=args.dedup,
         excel_bom=args.excel_bom,
+        raw_cells=args.raw_cells,
     )
 
     try:
@@ -2620,6 +3336,8 @@ def main() -> int:
                             include_annotations=include_annotations,
                             combine_scan_types=args.combine_scan_types,
                             ca_cert=args.ca_cert,
+                            request_all_scan_types=args.request_all_scan_types,
+                            prepare=exporter.new_batch,
                         )
 
                     # Bounded sliding window. Submitting all 15,000 tasks up front
@@ -2644,7 +3362,7 @@ def main() -> int:
                             if findings:
                                 apps_with_findings += 1
                             exporter.write_batch(findings)
-                            if any(r.get("Status") != "OK" for r in rows):
+                            if any(r.get("Status") not in RECON_OK_STATUSES for r in rows):
                                 apps_failed += 1
                             else:
                                 apps_ok += 1
@@ -2685,6 +3403,7 @@ def main() -> int:
                     max_workers=args.max_workers,
                     filter_apps=iac_filter_set,
                     ca_cert=args.ca_cert,
+                    all_scans=args.iac_all_scans,
                 )
 
                 if iac_records:
@@ -2722,6 +3441,11 @@ def main() -> int:
                             matched_name = asset
 
                         iac_apps += 1
+                        recon_row = rec.get("_recon")
+                        if isinstance(recon_row, dict):
+                            if info.get("guid") and uid_app_key == info["guid"]:
+                                recon_row = {**recon_row, "Application GUID": info["guid"]}
+                            exporter.write_recon([recon_row])
                         batch = []
                         for iac_finding in rec.get("detailed_findings", []):
                             try:
@@ -2748,6 +3472,13 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n\n  INTERRUPTED by user. The destination file was not modified.")
         return 130
+    except PublishError as exc:
+        print("\n  ERROR: the export finished but could not be published "
+              "(destination locked, e.g. open in Excel).")
+        for part in str(exc).split("; "):
+            print(f"    {part}")
+        print("  Close the file and rename the temp file, or re-run.\n")
+        return 1
 
     # --- Duplicate analysis ---
     print("\n" + "=" * 70)
